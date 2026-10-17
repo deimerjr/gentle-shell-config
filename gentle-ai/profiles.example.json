@@ -1,0 +1,53 @@
+{
+  "kind": "gentle-pi.agent_model_profiles",
+  "version": 1,
+  "profiles": {
+    "example": {
+      "orchestrator": {
+        "model": "cliproxyapi/account-1/model-slug",
+        "thinking": "high"
+      },
+      "gentle-ai-explore": {
+        "model": "cliproxyapi/account-2/model-slug",
+        "thinking": "high"
+      },
+      "gentle-ai-verify": {
+        "model": "cliproxyapi/account-3/model-slug",
+        "thinking": "high"
+      },
+      "gentle-ai-worker": {
+        "model": "cliproxyapi/account-4/model-slug",
+        "thinking": "high"
+      },
+      "jd-judge-a": {
+        "model": "cliproxyapi/account-5/model-slug",
+        "thinking": "high"
+      },
+      "jd-judge-b": {
+        "model": "cliproxyapi/account-6/model-slug",
+        "thinking": "high"
+      },
+      "jd-fix-agent": {
+        "model": "cliproxyapi/account-7/model-slug",
+        "thinking": "high"
+      },
+      "review-risk": {
+        "model": "cliproxyapi/account-8/model-slug",
+        "thinking": "high"
+      },
+      "review-reliability": {
+        "model": "cliproxyapi/account-9/model-slug",
+        "thinking": "high"
+      },
+      "review-resilience": {
+        "model": "cliproxyapi/account-10/model-slug",
+        "thinking": "high"
+      },
+      "review-readability": {
+        "model": "cliproxyapi/account-11/model-slug",
+        "thinking": "high"
+      }
+    }
+  },
+  "active": "example"
+}

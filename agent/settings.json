@@ -1,0 +1,21 @@
+{
+  "tuiMode": "fullscreen",
+  "theme": "Gentle",
+  "packages": [
+    "npm:gentle-engram",
+    "npm:pi-web-access",
+    "npm:pi-btw",
+    "npm:pi-token-speed"
+  ],
+  "extensions": [
+    "-builtin:codemode"
+  ],
+  "lastChangelogVersion": "1.3.0",
+  "defaultThinkingLevel": "high",
+  "hideThinkingBlock": true,
+  "defaultProvider": "nan",
+  "defaultModel": "deepseek-v4-flash",
+  "compaction": {
+    "enabled": false
+  }
+}

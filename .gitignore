@@ -1,0 +1,53 @@
+# Credentials, environment files, and private keys at any depth.
+.env
+.alt/
+.env.*
+!.env.example
+!.env.sample
+auth.json
+credentials.json
+secrets.json
+*.pem
+*.key
+*.p12
+*.pfx
+agent/npm/
+agent/web-search-cache/
+agent/gentle-agents/
+# Machine-local diagnostics and trust grants must not be restored from Git.
+agent/crashes.json
+agent/trust.json
+# Local model catalogs, account routing, and personal profiles.
+models.json
+models-store.json
+# Real account roster: publish profiles.example.json instead.
+/gentle-ai/profiles.json
+# Machine-local provisioning record (absolute local paths).
+/config.json
+
+# Dependencies, build products, logs, sessions, and caches.
+node_modules/
+dist/
+build/
+coverage/
+.cache/
+.codegraph/
+.runtime/
+sessions/
+*.jsonl
+*.log
+*.lock
+*.tsbuildinfo
+.DS_Store
+
+# Local snapshots and scratch directories created during investigations.
+.*review*/
+.tmp/
+# Bounded test/verifier sandboxes (extension copies, mutation runs, probe output).
+.tmp-*/
+*.tmp
+*.bak
+
+# Internal ODD working documents (specs, decision logs, session evidence).
+# Kept on disk for local continuity; never published.
+odd/
