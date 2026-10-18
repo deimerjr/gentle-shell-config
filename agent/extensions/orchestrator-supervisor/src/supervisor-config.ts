@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { computeFlowIdentity, resolveSupervisorDir } from './config.ts';
+import { resolveConfigurationLocation, selectConfigurationScope, withConfigurationLocation, type ConfigurationScope } from './configuration-scope.ts';
 import { isValidCandidateId } from './candidate-id.ts';
 import { withExclusiveFileLock, writeJsonAtomic } from './atomic-json.ts';
+import { validateModelEfforts, type ModelEffort } from './model-effort.ts';
 
 /**
  * Per-project supervisor configuration: whether the supervisor runs at all, the priority
@@ -46,6 +46,15 @@ export interface SupervisorConfig {
    * Empty means "use computed order".
    */
   priorityCandidateIds: string[];
+  /**
+   * Optional explicit reasoning effort per model, keyed by the full `<provider>/<modelId>`
+   * candidate ID. Absent entirely on files written before this field existed, so an old
+   * document stays valid; a present entry is validated strictly and never silently
+   * truncated, including entries for a model outside the active routing slots (S2).
+   * Absence of a specific key preserves the prior runtime behaviour for that model
+   * (Orchestrator defaults to `high`).
+   */
+  modelEfforts?: Record<string, ModelEffort>;
 }
 
 export const DEFAULT_SUPERVISOR_CONFIG: SupervisorConfig = {
@@ -87,7 +96,7 @@ const INT_RANGES: Record<'rotationThresholdPercent' | 'codexQuotaThresholdPercen
 export const SUPERVISOR_CONFIG_RANGES = INT_RANGES;
 
 export function resolveSupervisorConfigPath(cwd: string, flowKey?: string): string {
-  return join(resolveSupervisorDir(computeFlowIdentity(cwd, flowKey)), 'supervisor.json');
+  return resolveConfigurationLocation(cwd, 'supervisor', flowKey).path;
 }
 
 /**
@@ -160,6 +169,16 @@ export function validateSupervisorConfig(value: unknown): SupervisorConfig {
     config.priorityCandidateIds = [...slots];
   }
 
+  const efforts = validateModelEfforts(raw.modelEfforts, CONFIG_LABEL);
+  if (efforts !== undefined) {
+    for (const key of Object.keys(efforts)) {
+      if (!isValidCandidateId(key)) {
+        throw new Error(`Malformed ${CONFIG_LABEL}: invalid candidate ID "${key}" in modelEfforts`);
+      }
+    }
+    config.modelEfforts = efforts;
+  }
+
   return config;
 }
 
@@ -199,8 +218,8 @@ function readStoredConfig(path: string): { config: SupervisorConfig; source: 'fi
  * an unreadable control must not silently leave automatic actions running.
  */
 export function loadSupervisorConfig(cwd: string, flowKey?: string): SupervisorConfigLoad {
-  const path = resolveSupervisorConfigPath(cwd, flowKey);
   try {
+    const path = resolveSupervisorConfigPath(cwd, flowKey);
     const { config, source } = readStoredConfig(path);
     if (process.env.GENTLE_SUPERVISOR_DISABLED === '1') {
       return { config: { ...config, enabled: false }, source };
@@ -231,11 +250,10 @@ function persist(path: string, config: SupervisorConfig): SupervisorConfig {
  * failure the operator has not seen yet.
  */
 export function saveSupervisorConfig(cwd: string, config: SupervisorConfig, flowKey?: string): SupervisorConfig {
-  const path = resolveSupervisorConfigPath(cwd, flowKey);
-  return withExclusiveFileLock(path, CONFIG_LABEL, () => {
+  return withConfigurationLocation(cwd, 'supervisor', flowKey, ({ path }) => withExclusiveFileLock(path, CONFIG_LABEL, () => {
     readStoredConfig(path);
     return persist(path, config);
-  });
+  }));
 }
 
 /**
@@ -243,9 +261,14 @@ export function saveSupervisorConfig(cwd: string, config: SupervisorConfig, flow
  * concurrent writer cannot be clobbered, and refuses to overwrite an unusable file.
  */
 export function updateSupervisorConfig(cwd: string, patch: Partial<SupervisorConfig>, flowKey?: string): SupervisorConfig {
-  const path = resolveSupervisorConfigPath(cwd, flowKey);
-  return withExclusiveFileLock(path, CONFIG_LABEL, () => {
+  return withConfigurationLocation(cwd, 'supervisor', flowKey, ({ path }) => withExclusiveFileLock(path, CONFIG_LABEL, () => {
     const stored = readStoredConfig(path);
     return persist(path, { ...stored.config, ...patch });
-  });
+  }));
+}
+
+/** Select a complete destination document, preserving every other source unchanged. */
+export function selectSupervisorConfigScope(cwd: string, scope: ConfigurationScope, flowKey?: string) {
+  const selected = selectConfigurationScope(cwd, 'supervisor', scope, readStoredConfig, flowKey);
+  return { ...selected.value, location: selected.location };
 }

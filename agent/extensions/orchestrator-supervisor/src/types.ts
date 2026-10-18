@@ -19,6 +19,13 @@ export interface ModelCandidate {
   reasoningEffort: 'high';
   /** Known-safe context ceiling; omitted means fall back to the reported window. */
   contextWindowCap?: number;
+  /**
+   * Public-host-proven effort levels for this concrete model (`supportedModelEfforts`),
+   * enriched by the panel host from the actual registry model. Absent or empty means the
+   * capability is unknown: the effort picker then offers Default only, never an invented
+   * level.
+   */
+  supportedEfforts?: import('./model-effort.ts').ModelEffort[];
 }
 
 export interface RegisteredModel {

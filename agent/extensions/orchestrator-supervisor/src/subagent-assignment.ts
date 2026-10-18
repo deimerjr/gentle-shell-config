@@ -242,6 +242,8 @@ export function registerSubagentAssignment(pi: ExtensionAPI, deps: SubagentAssig
   const assignModel = async (r: ChildRuntime, ctx: any): Promise<void> => {
     const generation = r.generation;
     if (r.disposed || r.releaseRequested) return;
+    // A globally loaded extension must not consume repository preferences before trust.
+    if (ctx.isProjectTrusted && !ctx.isProjectTrusted()) return;
 
     // Configuration is read first: a disabled or empty slot list must never touch pool
     // storage, and must never be reported as a pool failure.
@@ -308,6 +310,14 @@ export function registerSubagentAssignment(pi: ExtensionAPI, deps: SubagentAssig
     if (!applied) {
       releaseCurrentLease(r, ctx);
       reportOnce(r, ctx, DIAGNOSTIC.setModelRejected);
+      return;
+    }
+    // Preserve host behavior unless this exact selected model has an explicit override.
+    // Apply only after success and the lifecycle/generation checks above; Pi owns clamping.
+    const effort = loaded.config.modelEfforts?.[selected.id];
+    if (effort !== undefined) {
+      try { pi.setThinkingLevel(effort); }
+      catch { /* Keep the successfully assigned model if an older host rejects the effort. */ }
     }
   };
 

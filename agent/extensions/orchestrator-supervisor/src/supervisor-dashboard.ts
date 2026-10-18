@@ -1,3 +1,12 @@
+import type { ConfigurationScopeControl } from './configuration-scope.ts';
+import { createConfigurationScopeEditor } from './configuration-scope-panel.ts';
+import {
+  formatSlotLabel,
+  renderEffortPicker,
+  resolveEffortMenuOptions,
+  computeEffortPatch,
+  type EffortMenuOption,
+} from './model-effort-panel.ts';
 import { PANEL_VISIBLE_ROWS, createSupervisorPanel, type SupervisorPanelOptions } from './supervisor-panel.ts';
 import { SUBAGENT_MODEL_COUNT_MAX, SUBAGENT_MODEL_COUNT_MIN, type SubagentConfig } from './subagent-config.ts';
 import type { ModelCandidate } from './types.ts';
@@ -27,7 +36,7 @@ export type { SubagentConfig };
 /** The allowed number of subagent routing slots, inclusive; sourced from the config contract. */
 export const SUBAGENT_MODEL_COUNT_RANGE: readonly [number, number] = [SUBAGENT_MODEL_COUNT_MIN, SUBAGENT_MODEL_COUNT_MAX];
 
-export type SubagentPanelRowId = 'toggle' | 'modelCount' | `slot:${number}`;
+export type SubagentPanelRowId = 'scope' | 'toggle' | 'modelCount' | `slot:${number}`;
 
 /** Every selectable Subagents row, in the order ↑/↓ walks them. */
 export function getSubagentRowIds(config: SubagentConfig): readonly SubagentPanelRowId[] {
@@ -44,6 +53,7 @@ export interface SupervisorDashboardOptions {
   subagents: {
     /** Current effective per-project subagent configuration. */
     config: SubagentConfig;
+    scopeControl?: ConfigurationScopeControl<SubagentConfig>;
     /** The host's Pi registry catalogue for the subagent slot pickers. */
     candidates: ModelCandidate[];
     /** Set when the stored subagent document could not be trusted; then edits are refused. */
@@ -87,6 +97,10 @@ interface PickerState {
   targetSlot: number;
   query: string;
   selected: number;
+  stage: 'model' | 'effort';
+  selectedCandidate?: ModelCandidate;
+  effortOptions?: EffortMenuOption[];
+  effortSelected?: number;
 }
 
 interface SubagentPanelOptions {
@@ -95,6 +109,7 @@ interface SubagentPanelOptions {
   theme: any;
   keybindings: any;
   config: SubagentConfig;
+  scopeControl?: ConfigurationScopeControl<SubagentConfig>;
   candidates: ModelCandidate[];
   error?: string;
   applyConfig: (patch: Partial<SubagentConfig>) => SubagentConfig;
@@ -110,7 +125,7 @@ interface SubagentPanelOptions {
  * read-only: it still renders and its tab stays reachable, but no edit is applied.
  */
 function createSubagentPanel(options: SubagentPanelOptions): any {
-  const { lib, tui, theme, keybindings, candidates, error, applyConfig, onError, done, isBound } = options;
+  const { lib, tui, theme, keybindings, candidates, applyConfig, onError, done, isBound } = options;
   const { truncateToWidth, visibleWidth } = lib;
   const clip = (text: string, width: number): string => truncateToWidth(text, width, '…');
   const style = {
@@ -121,14 +136,29 @@ function createSubagentPanel(options: SubagentPanelOptions): any {
     bold: (text: string) => theme.bold(text),
   };
 
-  let config: SubagentConfig = { ...options.config, priorityCandidateIds: [...options.config.priorityCandidateIds] };
+  let config: SubagentConfig = {
+    ...options.config,
+    priorityCandidateIds: [...options.config.priorityCandidateIds],
+    modelEfforts: options.config.modelEfforts ? { ...options.config.modelEfforts } : undefined,
+  };
   let selectedIndex = 0;
   let pickerState: PickerState | null = null;
   let lastWidth = 80;
   let focused = true;
-  const disabled = typeof error === 'string' && error.length > 0;
-
-  const rowIds = (): readonly SubagentPanelRowId[] => getSubagentRowIds(config);
+  let error = options.error;
+  const disabled = (): boolean => Boolean(error);
+  const scopeEditor = createConfigurationScopeEditor(options.scopeControl, (next, nextError) => {
+    config = {
+      ...next,
+      priorityCandidateIds: [...next.priorityCandidateIds],
+      modelEfforts: next.modelEfforts ? { ...next.modelEfforts } : undefined,
+    };
+    error = nextError;
+    pickerState = null;
+    selectedIndex = rowIds().indexOf('scope');
+  }, onError);
+  const rowIds = (): readonly SubagentPanelRowId[] => scopeEditor.available ? ['scope', ...getSubagentRowIds(config)] : getSubagentRowIds(config);
+  selectedIndex = scopeEditor.available ? 1 : 0;
 
   /** The visible slot editors: the active prefix of the saved list, padded with empties. */
   const slots = (): string[] => {
@@ -152,10 +182,14 @@ function createSubagentPanel(options: SubagentPanelOptions): any {
 
   /** Persists through the injected host API and adopts the returned document. Never mocks. */
   const applyPatch = (patch: Partial<SubagentConfig>): boolean => {
-    if (disabled) return false;
+    if (disabled()) return false;
     try {
       const next = applyConfig(patch);
-      config = { ...next, priorityCandidateIds: [...(next.priorityCandidateIds ?? [])] };
+      config = {
+        ...next,
+        priorityCandidateIds: [...(next.priorityCandidateIds ?? [])],
+        modelEfforts: next.modelEfforts ? { ...next.modelEfforts } : undefined,
+      };
       return true;
     } catch {
       onError(SUBAGENT_SAVE_ERROR);
@@ -180,7 +214,7 @@ function createSubagentPanel(options: SubagentPanelOptions): any {
 
   const openPicker = (slotNumber: number): void => {
     selectedIndex = Math.max(0, rowIds().indexOf(`slot:${slotNumber}` as SubagentPanelRowId));
-    pickerState = { targetSlot: slotNumber, query: '', selected: 0 };
+    pickerState = { targetSlot: slotNumber, query: '', selected: 0, stage: 'model' };
     tui.requestRender?.();
   };
 
@@ -231,11 +265,49 @@ function createSubagentPanel(options: SubagentPanelOptions): any {
       return;
     }
     if (entry.usedInSlot !== undefined) return; // Owned by another slot (visible or hidden): refuse.
-    if (full[index] === entry.id) { closePicker(); tui.requestRender?.(); return; }
+
+    const candidate = candidates.find(c => c.id === entry.id) ?? {
+      id: entry.id!,
+      source: 'account' as const,
+      quotaProtocol: 'none' as const,
+      modelSlug: entry.id!,
+      provider: '',
+      reasoningEffort: 'high' as const,
+    };
+
+    const currentOverride = config.modelEfforts?.[candidate.id];
+    const { options: effortOptions, initialIndex } = resolveEffortMenuOptions(candidate, currentOverride);
+
+    picker.stage = 'effort';
+    picker.selectedCandidate = candidate;
+    picker.effortOptions = effortOptions;
+    picker.effortSelected = initialIndex;
+    tui.requestRender?.();
+  };
+
+  const confirmEffortPicker = (): void => {
+    const picker = pickerState;
+    if (!picker || picker.stage !== 'effort' || !picker.selectedCandidate || !picker.effortOptions) return;
+
+    const candidate = picker.selectedCandidate;
+    const chosenEffort = picker.effortOptions[clampIndex(picker.effortSelected ?? 0, picker.effortOptions.length)];
+    const full = config.priorityCandidateIds;
+    const index = picker.targetSlot - 1;
+
     const next = [...full];
     while (next.length <= index) next.push('');
-    next[index] = entry.id!;
-    if (applyPatch({ priorityCandidateIds: next })) { closePicker(); tui.requestRender?.(); }
+    next[index] = candidate.id;
+
+    const effortPatch = computeEffortPatch(candidate.id, chosenEffort, config.modelEfforts);
+    const patch: Partial<SubagentConfig> = {
+      priorityCandidateIds: next,
+      ...effortPatch,
+    };
+
+    if (applyPatch(patch)) {
+      closePicker();
+      tui.requestRender?.();
+    }
   };
 
   /** Renders one `[-] value [+]` row and registers its click zones. */
@@ -273,7 +345,12 @@ function createSubagentPanel(options: SubagentPanelOptions): any {
     push(style.bold(style.accent(' Subagent router configuration')));
     rule();
 
-    if (disabled) {
+    if (scopeEditor.available) {
+      const [source, path] = scopeEditor.lines(rowIds()[selectedIndex] === 'scope');
+      hits.push({ id: 'scope', y: push(source) });
+      push(path);
+    }
+    if (disabled()) {
       push(style.warning(` configuration error: ${error ?? ''}`));
       push(style.dim(SUBAGENT_DISABLED_NOTE));
     }
@@ -292,10 +369,11 @@ function createSubagentPanel(options: SubagentPanelOptions): any {
     for (let slot = 1; slot <= config.modelCount; slot++) {
       const id: SubagentPanelRowId = `slot:${slot}`;
       const value = current[slot - 1];
-      hits.push({ id, y: push(`${marker(rowIds()[selectedIndex] === id)}${slot}. ${value || '(empty)'}`) });
+      const slotText = formatSlotLabel(slot, value, config.modelEfforts);
+      hits.push({ id, y: push(`${marker(rowIds()[selectedIndex] === id)}${slotText}`) });
     }
 
-    if (!disabled) push(style.dim(SUBAGENT_SAVED_NOTE));
+    if (!disabled()) push(style.dim(SUBAGENT_SAVED_NOTE));
 
     push('');
     rule();
@@ -342,11 +420,32 @@ function createSubagentPanel(options: SubagentPanelOptions): any {
     return { lines, hits: [] };
   };
 
-  const build = (width: number): { lines: string[]; hits: PanelHitRow[] } => (pickerState ? renderPicker(width) : renderRows(width));
+  const build = (width: number): { lines: string[]; hits: PanelHitRow[] } => {
+    if (!pickerState) return renderRows(width);
+    if (pickerState.stage === 'effort' && pickerState.selectedCandidate && pickerState.effortOptions) {
+      return {
+        lines: renderEffortPicker({
+          width,
+          targetSlot: pickerState.targetSlot,
+          candidateId: pickerState.selectedCandidate.id,
+          options: pickerState.effortOptions,
+          selectedIndex: clampIndex(pickerState.effortSelected ?? 0, pickerState.effortOptions.length),
+          style,
+          lib,
+        }),
+        hits: [],
+      };
+    }
+    return renderPicker(width);
+  };
 
   const handleRowInput = (data: string): void => {
     const rows = rowIds();
     const id = rows[selectedIndex];
+    if (id === 'scope' && (keybindings.matches(data, 'tui.select.confirm') || keybindings.matches(data, 'tui.editor.cursorLeft') || keybindings.matches(data, 'tui.editor.cursorRight'))) {
+      scopeEditor.select(keybindings.matches(data, 'tui.editor.cursorLeft') ? 'project' : keybindings.matches(data, 'tui.editor.cursorRight') ? 'global' : undefined);
+      tui.requestRender?.(); return;
+    }
     if (data === 'd' && id?.startsWith('slot:')) {
       const index = Number(id.slice('slot:'.length)) - 1;
       if (!config.priorityCandidateIds[index]) return;
@@ -360,6 +459,7 @@ function createSubagentPanel(options: SubagentPanelOptions): any {
     else if (keybindings.matches(data, 'tui.select.pageUp')) selectedIndex = clampIndex(selectedIndex - PANEL_VISIBLE_ROWS, rows.length);
     else if (keybindings.matches(data, 'tui.select.pageDown')) selectedIndex = clampIndex(selectedIndex + PANEL_VISIBLE_ROWS, rows.length);
     else if (keybindings.matches(data, 'tui.select.confirm')) {
+      if (disabled()) return;
       if (id === 'toggle') { flipEnabled(); return; }
       if (id && id.startsWith('slot:')) { openPicker(Number(id.slice('slot:'.length))); return; }
     } else if (id === 'modelCount' && keybindings.matches(data, 'tui.editor.cursorLeft')) stepModelCount(-1);
@@ -370,6 +470,29 @@ function createSubagentPanel(options: SubagentPanelOptions): any {
   const handlePickerInput = (data: string): void => {
     const picker = pickerState;
     if (!picker) return;
+
+    if (picker.stage === 'effort') {
+      if (keybindings.matches(data, 'tui.select.cancel')) {
+        picker.stage = 'model';
+        picker.selectedCandidate = undefined;
+        picker.effortOptions = undefined;
+        picker.effortSelected = undefined;
+        tui.requestRender?.();
+        return;
+      }
+      if (keybindings.matches(data, 'tui.select.confirm')) {
+        confirmEffortPicker();
+        return;
+      }
+      const total = picker.effortOptions?.length ?? 1;
+      if (keybindings.matches(data, 'tui.select.up')) picker.effortSelected = clampIndex((picker.effortSelected ?? 0) - 1, total);
+      else if (keybindings.matches(data, 'tui.select.down')) picker.effortSelected = clampIndex((picker.effortSelected ?? 0) + 1, total);
+      else if (keybindings.matches(data, 'tui.select.pageUp')) picker.effortSelected = clampIndex((picker.effortSelected ?? 0) - PANEL_VISIBLE_ROWS, total);
+      else if (keybindings.matches(data, 'tui.select.pageDown')) picker.effortSelected = clampIndex((picker.effortSelected ?? 0) + PANEL_VISIBLE_ROWS, total);
+      tui.requestRender?.();
+      return;
+    }
+
     if (keybindings.matches(data, 'tui.select.confirm')) { confirmPicker(); return; }
 
     const total = pickerEntries().length;
@@ -385,18 +508,28 @@ function createSubagentPanel(options: SubagentPanelOptions): any {
   const handleInput = (data: string): void => {
     if (!isBound()) { done(); return; }
     if (keybindings.matches(data, 'tui.select.cancel')) {
-      if (pickerState) { closePicker(); tui.requestRender?.(); return; }
+      if (pickerState) {
+        if (pickerState.stage === 'effort') {
+          pickerState.stage = 'model';
+          pickerState.selectedCandidate = undefined;
+          pickerState.effortOptions = undefined;
+          pickerState.effortSelected = undefined;
+          tui.requestRender?.();
+          return;
+        }
+        closePicker();
+        tui.requestRender?.();
+        return;
+      }
       done();
       return;
     }
-    if (disabled) return; // A stored-document error refuses every edit; Escape still closes.
     if (pickerState) handlePickerInput(data);
     else handleRowInput(data);
   };
 
   const handleMouse = (event: any): void => {
     if (!isBound()) { done(); return; }
-    if (disabled) return;
     if (pickerState) return; // The picker is keyboard-driven.
     if (!event || event.type !== 'press' || event.button !== 'left') return;
     if (!Number.isFinite(event.x) || !Number.isFinite(event.y)) return;
@@ -404,6 +537,8 @@ function createSubagentPanel(options: SubagentPanelOptions): any {
     const hit = build(lastWidth).hits.find(row => row.y === event.y);
     if (!hit) return;
     selectedIndex = Math.max(0, rowIds().indexOf(hit.id));
+    if (hit.id === 'scope') { scopeEditor.select(); tui.requestRender?.(); return; }
+    if (disabled()) return;
     if (hit.id === 'toggle') { flipEnabled(); return; }
     if (hit.id.startsWith('slot:')) { openPicker(Number(hit.id.slice('slot:'.length))); return; }
     if (hit.id === 'modelCount') {
@@ -465,6 +600,7 @@ export function createSupervisorDashboard(options: SupervisorDashboardOptions): 
     theme,
     keybindings,
     config: subagents.config,
+    scopeControl: subagents.scopeControl,
     candidates: subagents.candidates,
     error: subagents.error,
     applyConfig: subagents.applyConfig,

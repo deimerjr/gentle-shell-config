@@ -1,3 +1,12 @@
+import type { ConfigurationScopeControl } from './configuration-scope.ts';
+import { createConfigurationScopeEditor } from './configuration-scope-panel.ts';
+import {
+  formatSlotLabel,
+  renderEffortPicker,
+  resolveEffortMenuOptions,
+  computeEffortPatch,
+  type EffortMenuOption,
+} from './model-effort-panel.ts';
 import {
   SUPERVISOR_CONFIG_RANGES,
   type SupervisorConfig,
@@ -20,7 +29,7 @@ import type { ModelCandidate } from './types.ts';
 /** Rows the panel shows before its scrollable row window moves. */
 export const PANEL_VISIBLE_ROWS = 12;
 
-export type PanelRowId = 'toggle' | 'autoRotate' | 'autoSwitch' | 'modelCount' | `slot:${number}` | 'rotation' | 'codexQuota' | 'retries' | 'cooldown' | 'poll';
+export type PanelRowId = 'scope' | 'toggle' | 'autoRotate' | 'autoSwitch' | 'modelCount' | `slot:${number}` | 'rotation' | 'codexQuota' | 'retries' | 'cooldown' | 'poll';
 
 /**
  * Every selectable row, in the order ↑/↓ walks them. The list is dynamic: `modelCount`
@@ -70,6 +79,8 @@ export interface SupervisorPanelOptions {
   keybindings: any;
   /** Current effective per-project config. */
   config: SupervisorConfig;
+  scopeControl?: ConfigurationScopeControl<SupervisorConfig>;
+  error?: string;
   /** Live state for the read-only section; re-read on every render. */
   state: () => SupervisorPanelState;
   /** Routing catalogue for the slot pickers. */
@@ -175,6 +186,10 @@ interface PickerState {
   targetSlot: number;
   query: string;
   selected: number;
+  stage: 'model' | 'effort';
+  selectedCandidate?: ModelCandidate;
+  effortOptions?: EffortMenuOption[];
+  effortSelected?: number;
 }
 
 /**
@@ -197,6 +212,7 @@ export function createSupervisorPanel(options: SupervisorPanelOptions): any {
   let config: SupervisorConfig = {
     ...options.config,
     priorityCandidateIds: [...options.config.priorityCandidateIds],
+    modelEfforts: options.config.modelEfforts ? { ...options.config.modelEfforts } : undefined,
   };
   let selectedIndex = 0;
   let pickerState: PickerState | null = null;
@@ -205,7 +221,21 @@ export function createSupervisorPanel(options: SupervisorPanelOptions): any {
   /** Set while switching the master switch on waits for its second confirmation. */
   let confirmEnable = false;
 
-  const rowIds = (): readonly PanelRowId[] => getPanelRowIds(config);
+  let configError = options.error;
+  const scopeEditor = createConfigurationScopeEditor(options.scopeControl, (next, error) => {
+    config = {
+      ...next,
+      priorityCandidateIds: [...next.priorityCandidateIds],
+      modelEfforts: next.modelEfforts ? { ...next.modelEfforts } : undefined,
+    };
+    configError = error;
+    confirmEnable = false;
+    pickerState = null;
+    selectedIndex = rowIds().indexOf('scope');
+  }, onError);
+  const rowIds = (): readonly PanelRowId[] => scopeEditor.available ? ['scope', ...getPanelRowIds(config)] : getPanelRowIds(config);
+  // Preserve the existing initial Enter behavior: the master switch owns initial focus.
+  selectedIndex = scopeEditor.available ? 1 : 0;
 
   /** The visible slot editors: the active prefix of the saved list, padded with empties. */
   const slots = (): string[] => {
@@ -229,6 +259,7 @@ export function createSupervisorPanel(options: SupervisorPanelOptions): any {
   const marker = (isSelected: boolean): string => (isSelected ? '→ ' : '  ');
 
   const applyPatch = (patch: Partial<SupervisorConfig>): boolean => {
+    if (configError) return false;
     try {
       config = applyConfig(patch);
       return true;
@@ -290,7 +321,7 @@ export function createSupervisorPanel(options: SupervisorPanelOptions): any {
 
   const openPicker = (slotNumber: number): void => {
     selectedIndex = Math.max(0, rowIds().indexOf(`slot:${slotNumber}` as PanelRowId));
-    pickerState = { targetSlot: slotNumber, query: '', selected: 0 };
+    pickerState = { targetSlot: slotNumber, query: '', selected: 0, stage: 'model' };
     tui.requestRender?.();
   };
 
@@ -338,11 +369,49 @@ export function createSupervisorPanel(options: SupervisorPanelOptions): any {
       return;
     }
     if (entry.usedInSlot !== undefined) return; // Owned by another slot (visible or hidden): refuse.
-    if (full[index] === entry.id) { closePicker(); tui.requestRender?.(); return; }
+
+    const candidate = candidates.find(c => c.id === entry.id) ?? {
+      id: entry.id!,
+      source: 'account' as const,
+      quotaProtocol: 'none' as const,
+      modelSlug: entry.id!,
+      provider: '',
+      reasoningEffort: 'high' as const,
+    };
+
+    const currentOverride = config.modelEfforts?.[candidate.id];
+    const { options: effortOptions, initialIndex } = resolveEffortMenuOptions(candidate, currentOverride);
+
+    picker.stage = 'effort';
+    picker.selectedCandidate = candidate;
+    picker.effortOptions = effortOptions;
+    picker.effortSelected = initialIndex;
+    tui.requestRender?.();
+  };
+
+  const confirmEffortPicker = (): void => {
+    const picker = pickerState;
+    if (!picker || picker.stage !== 'effort' || !picker.selectedCandidate || !picker.effortOptions) return;
+
+    const candidate = picker.selectedCandidate;
+    const chosenEffort = picker.effortOptions[clampIndex(picker.effortSelected ?? 0, picker.effortOptions.length)];
+    const full = config.priorityCandidateIds;
+    const index = picker.targetSlot - 1;
+
     const next = [...full];
-    if (index < next.length) next[index] = entry.id!;
-    else next.push(entry.id!);
-    if (applyPatch({ priorityCandidateIds: next })) { closePicker(); tui.requestRender?.(); }
+    if (index < next.length) next[index] = candidate.id;
+    else next.push(candidate.id);
+
+    const effortPatch = computeEffortPatch(candidate.id, chosenEffort, config.modelEfforts);
+    const patch: Partial<SupervisorConfig> = {
+      priorityCandidateIds: next,
+      ...effortPatch,
+    };
+
+    if (applyPatch(patch)) {
+      closePicker();
+      tui.requestRender?.();
+    }
   };
 
   /** Renders one `[-] value [+]` row and registers its click zones. */
@@ -381,6 +450,12 @@ export function createSupervisorPanel(options: SupervisorPanelOptions): any {
     push(style.bold(style.accent(' Supervisor control panel')));
     rule();
 
+    if (scopeEditor.available) {
+      const [source, path] = scopeEditor.lines(rowIds()[selectedIndex] === 'scope');
+      hits.push({ id: 'scope', y: push(source) });
+      push(path);
+    }
+    if (configError) push(style.warning(` configuration error: ${configError}`));
     const live = readState();
     push(style.muted(' State'));
     if (!live.running) {
@@ -414,7 +489,8 @@ export function createSupervisorPanel(options: SupervisorPanelOptions): any {
     for (let slot = 1; slot <= config.modelCount; slot++) {
       const id: PanelRowId = `slot:${slot}`;
       const value = current[slot - 1];
-      hits.push({ id, y: push(`${marker(rowIds()[selectedIndex] === id)}${slot}. ${value || '(empty)'}`) });
+      const slotText = formatSlotLabel(slot, value, config.modelEfforts);
+      hits.push({ id, y: push(`${marker(rowIds()[selectedIndex] === id)}${slotText}`) });
     }
 
     push('');
@@ -472,7 +548,24 @@ export function createSupervisorPanel(options: SupervisorPanelOptions): any {
     return { lines, hits: [] };
   };
 
-  const build = (width: number): PanelRender => (pickerState ? renderPicker(width) : renderRows(width));
+  const build = (width: number): PanelRender => {
+    if (!pickerState) return renderRows(width);
+    if (pickerState.stage === 'effort' && pickerState.selectedCandidate && pickerState.effortOptions) {
+      return {
+        lines: renderEffortPicker({
+          width,
+          targetSlot: pickerState.targetSlot,
+          candidateId: pickerState.selectedCandidate.id,
+          options: pickerState.effortOptions,
+          selectedIndex: clampIndex(pickerState.effortSelected ?? 0, pickerState.effortOptions.length),
+          style,
+          lib,
+        }),
+        hits: [],
+      };
+    }
+    return renderPicker(width);
+  };
 
   const handleRowInput = (data: string): void => {
     if (keybindings.matches(data, 'tui.select.cancel')) {
@@ -483,11 +576,16 @@ export function createSupervisorPanel(options: SupervisorPanelOptions): any {
     }
     const rows = rowIds();
     const id = rows[selectedIndex];
+    if (id === 'scope' && (keybindings.matches(data, 'tui.select.confirm') || keybindings.matches(data, 'tui.editor.cursorLeft') || keybindings.matches(data, 'tui.editor.cursorRight'))) {
+      scopeEditor.select(keybindings.matches(data, 'tui.editor.cursorLeft') ? 'project' : keybindings.matches(data, 'tui.editor.cursorRight') ? 'global' : undefined);
+      tui.requestRender?.(); return;
+    }
     if (keybindings.matches(data, 'tui.select.up')) selectedIndex = clampIndex(selectedIndex - 1, rows.length);
     else if (keybindings.matches(data, 'tui.select.down')) selectedIndex = clampIndex(selectedIndex + 1, rows.length);
     else if (keybindings.matches(data, 'tui.select.pageUp')) selectedIndex = clampIndex(selectedIndex - PANEL_VISIBLE_ROWS, rows.length);
     else if (keybindings.matches(data, 'tui.select.pageDown')) selectedIndex = clampIndex(selectedIndex + PANEL_VISIBLE_ROWS, rows.length);
     else if (keybindings.matches(data, 'tui.select.confirm')) {
+      if (configError) return;
       if (id === 'toggle') { flipEnabled(); return; }
       if (confirmEnable) { confirmEnable = false; tui.requestRender?.(); return; }
       const capability = CAPABILITY_ROWS.find(row => row.id === id);
@@ -501,6 +599,29 @@ export function createSupervisorPanel(options: SupervisorPanelOptions): any {
   const handlePickerInput = (data: string): void => {
     const picker = pickerState;
     if (!picker) return;
+
+    if (picker.stage === 'effort') {
+      if (keybindings.matches(data, 'tui.select.cancel')) {
+        picker.stage = 'model';
+        picker.selectedCandidate = undefined;
+        picker.effortOptions = undefined;
+        picker.effortSelected = undefined;
+        tui.requestRender?.();
+        return;
+      }
+      if (keybindings.matches(data, 'tui.select.confirm')) {
+        confirmEffortPicker();
+        return;
+      }
+      const total = picker.effortOptions?.length ?? 1;
+      if (keybindings.matches(data, 'tui.select.up')) picker.effortSelected = clampIndex((picker.effortSelected ?? 0) - 1, total);
+      else if (keybindings.matches(data, 'tui.select.down')) picker.effortSelected = clampIndex((picker.effortSelected ?? 0) + 1, total);
+      else if (keybindings.matches(data, 'tui.select.pageUp')) picker.effortSelected = clampIndex((picker.effortSelected ?? 0) - PANEL_VISIBLE_ROWS, total);
+      else if (keybindings.matches(data, 'tui.select.pageDown')) picker.effortSelected = clampIndex((picker.effortSelected ?? 0) + PANEL_VISIBLE_ROWS, total);
+      tui.requestRender?.();
+      return;
+    }
+
     if (keybindings.matches(data, 'tui.select.cancel')) { closePicker(); tui.requestRender?.(); return; }
     if (keybindings.matches(data, 'tui.select.confirm')) { confirmPicker(); return; }
 
@@ -535,6 +656,8 @@ export function createSupervisorPanel(options: SupervisorPanelOptions): any {
       const hit = build(lastWidth).hits.find(row => row.y === event.y);
       if (!hit) return;
       selectedIndex = Math.max(0, rowIds().indexOf(hit.id));
+      if (hit.id === 'scope') { scopeEditor.select(); tui.requestRender?.(); return; }
+      if (configError) return;
       if (hit.id === 'toggle') { flipEnabled(); return; }
       // Any other click abandons a pending enable confirmation; a second click on the
       // toggle confirms it.

@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { computeFlowIdentity, resolveSupervisorDir } from './config.ts';
+import { resolveConfigurationLocation, selectConfigurationScope, withConfigurationLocation, type ConfigurationScope } from './configuration-scope.ts';
 import { isValidCandidateId } from './candidate-id.ts';
 import { withExclusiveFileLock, writeJsonAtomic } from './atomic-json.ts';
+import { validateModelEfforts, type ModelEffort } from './model-effort.ts';
 
 /**
  * Per-project subagent configuration: whether automatic subagent model assignment is
@@ -45,6 +45,13 @@ export interface SubagentConfig {
    * stay stored and hidden. Empty means no model preference is configured.
    */
   priorityCandidateIds: string[];
+  /**
+   * Optional explicit reasoning effort per model, keyed by the full `<provider>/<modelId>`
+   * candidate ID. Absent entirely on files written before this field existed, so an old
+   * document stays valid; a present entry is validated strictly and never silently
+   * truncated, including an entry for a model hidden by the current `modelCount`.
+   */
+  modelEfforts?: Record<string, ModelEffort>;
 }
 
 export const DEFAULT_SUBAGENT_CONFIG: SubagentConfig = {
@@ -71,7 +78,7 @@ export const SUBAGENT_CONFIG_RANGES = Object.freeze({
 });
 
 export function resolveSubagentConfigPath(cwd: string, flowKey?: string): string {
-  return join(resolveSupervisorDir(computeFlowIdentity(cwd, flowKey)), 'subagents.json');
+  return resolveConfigurationLocation(cwd, 'subagents', flowKey).path;
 }
 
 /**
@@ -128,6 +135,24 @@ function readPriorityCandidateIds(value: unknown): string[] {
 }
 
 /**
+ * S1/S2: validates the optional per-model effort map. `undefined` stays `undefined`
+ * (compatible with files written before this field existed). Keys are validated as
+ * candidate IDs with the same check as `priorityCandidateIds`, so a malformed key is
+ * reported with the same wording as every other invalid candidate ID in this document.
+ * No entry is ever dropped for being outside the active `modelCount`.
+ */
+function readModelEfforts(value: unknown): Record<string, ModelEffort> | undefined {
+  const efforts = validateModelEfforts(value, CONFIG_LABEL);
+  if (efforts === undefined) return undefined;
+  for (const key of Object.keys(efforts)) {
+    if (!isValidCandidateId(key)) {
+      throw new Error(`Malformed ${CONFIG_LABEL}: invalid candidate ID "${key}" in modelEfforts`);
+    }
+  }
+  return efforts;
+}
+
+/**
  * Normalizes a stored document to a usable config. An absent field keeps its default; a
  * present-but-unusable field is an error, so a damaged document is reported instead of
  * quietly reinterpreting what the operator assigned.
@@ -142,11 +167,14 @@ export function validateSubagentConfig(value: unknown): SubagentConfig {
     throw new Error(`Malformed ${CONFIG_LABEL}: unsupported version ${String(raw.version)}`);
   }
 
-  return {
+  const config: SubagentConfig = {
     enabled: readBoolean(raw.enabled, 'enabled', DEFAULT_SUBAGENT_CONFIG.enabled),
     modelCount: readModelCount(raw.modelCount),
     priorityCandidateIds: readPriorityCandidateIds(raw.priorityCandidateIds),
   };
+  const modelEfforts = readModelEfforts(raw.modelEfforts);
+  if (modelEfforts !== undefined) config.modelEfforts = modelEfforts;
+  return config;
 }
 
 /**
@@ -188,8 +216,8 @@ function readStoredConfig(path: string): { config: SubagentConfig; source: 'file
  * Orchestrator and must not change what the Subagents view reports or stores.
  */
 export function loadSubagentConfig(cwd: string, flowKey?: string): SubagentConfigLoad {
-  const path = resolveSubagentConfigPath(cwd, flowKey);
   try {
+    const path = resolveSubagentConfigPath(cwd, flowKey);
     return readStoredConfig(path);
   } catch (err: any) {
     return {
@@ -217,9 +245,14 @@ function persist(path: string, config: SubagentConfig): SubagentConfig {
  * exactly as they were.
  */
 export function updateSubagentConfig(cwd: string, patch: Partial<SubagentConfig>, flowKey?: string): SubagentConfig {
-  const path = resolveSubagentConfigPath(cwd, flowKey);
-  return withExclusiveFileLock(path, CONFIG_LABEL, () => {
+  return withConfigurationLocation(cwd, 'subagents', flowKey, ({ path }) => withExclusiveFileLock(path, CONFIG_LABEL, () => {
     const stored = readStoredConfig(path);
     return persist(path, { ...stored.config, ...patch });
-  });
+  }));
+}
+
+/** Select a complete destination document, preserving every other source unchanged. */
+export function selectSubagentConfigScope(cwd: string, scope: ConfigurationScope, flowKey?: string) {
+  const selected = selectConfigurationScope(cwd, 'subagents', scope, readStoredConfig, flowKey);
+  return { ...selected.value, location: selected.location };
 }

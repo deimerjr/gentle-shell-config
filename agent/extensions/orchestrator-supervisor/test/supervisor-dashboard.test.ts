@@ -270,8 +270,13 @@ test('DASH-005 (S4): subagent pickers hide other slots and restore released mode
   assert.ok(picker.includes(piIds[4]), 'unassigned Pi models stay selectable');
   assert.equal(h.subagentPatches.length, 0, 'opening the picker never saves');
 
-  // Keeping the current model closes the picker without writing.
+  // Keeping the current model allows opening effort menu and escaping without writing.
   h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 2'), h.text());
+  assert.equal(h.subagentPatches.length, 0);
+  h.component.handleInput('\x1b'); // Escape back to model picker
+  assert.ok(h.text().includes('Assign subagent slot 2'), h.text());
+  h.component.handleInput('\x1b'); // Escape closes picker
   assert.equal(h.subagentPatches.length, 0);
   assert.ok(!h.text().includes('Assign subagent slot 2'));
   selectRow(h, 'slot:2');
@@ -293,6 +298,8 @@ test('DASH-005 (S4): subagent pickers hide other slots and restore released mode
   selectRow(h, 'slot:2');
   h.component.handleInput('\r');
   for (const character of 'grok') h.component.handleInput(character);
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 2'), h.text());
   h.component.handleInput('\r');
   assert.deepEqual(h.subagentPatches.at(-1), { priorityCandidateIds: [piIds[0], piIds[4], piIds[3]] });
   assert.deepEqual(h.subagentConfig().priorityCandidateIds, [piIds[0], piIds[4], piIds[3]]);
@@ -333,6 +340,8 @@ test('DASH-019: d empties only the highlighted Subagents slot and leaves other p
   h.component.handleInput('\x7f');
   selectPickerEntry(h, piIds[4]);
   h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 2'), h.text());
+  h.component.handleInput('\r');
   assert.deepEqual(h.subagentConfig().priorityCandidateIds, [piIds[0], piIds[4], piIds[2], piIds[3]]);
   assert.deepEqual(h.orchestratorPatches, []);
   assert.deepEqual(h.errors, []);
@@ -346,6 +355,8 @@ test('DASH-020: assignment to a later empty slot pads gaps and d respects save f
   assert.deepEqual(h.subagentPatches, [], 'unassigned slots are a no-op');
   h.component.handleInput('\r');
   selectPickerEntry(h, piIds[1]);
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 4'), h.text());
   h.component.handleInput('\r');
   assert.deepEqual(h.subagentConfig().priorityCandidateIds, [piIds[0], '', '', piIds[1]]);
   h.setBound(false);
@@ -601,6 +612,8 @@ test('DASH-015 (PRESERVE): Orchestrator safety confirmation and its picker still
   assert.ok(h.text().includes('Assign priority slot 1'), h.text());
   for (const character of 'second') h.component.handleInput(character);
   h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'), h.text());
+  h.component.handleInput('\r');
   assert.deepEqual(h.orchestratorPatches.at(-1), { priorityCandidateIds: [orchSecond] });
 });
 
@@ -619,6 +632,8 @@ test('DASH-016 (S6): the same model may be configured for Orchestrator and Subag
   assert.ok(picker.includes(shared), picker);
   assert.ok(!picker.includes('(in slot'), 'an Orchestrator entry is not a Subagents duplicate: ' + picker);
 
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'), h.text());
   h.component.handleInput('\r');
   assert.deepEqual(h.subagentPatches.at(-1), { priorityCandidateIds: [shared] });
 });
@@ -640,4 +655,150 @@ test('DASH-017: a refused subagent write reports the failure and keeps the view 
 test('DASH-018 (S6): getSubagentRowIds mirrors the rows the Subagents view exposes', () => {
   assert.deepEqual([...getSubagentRowIds({ enabled: true, modelCount: 2, priorityCandidateIds: [] })], ['toggle', 'modelCount', 'slot:1', 'slot:2']);
   assert.deepEqual([...getSubagentRowIds({ enabled: false, modelCount: 20, priorityCandidateIds: [] })].slice(0, 3), ['toggle', 'modelCount', 'slot:1']);
+});
+
+test('DASH-021 (S1): Subagents effort menu opens after model selection and persists atomically', () => {
+  const effortCandidate: ModelCandidate = {
+    ...piCandidates[0],
+    id: 'openai/gpt-5-codex-effort',
+    supportedEfforts: ['low', 'medium', 'high'],
+  };
+  const h = harness({
+    subagentCandidates: [effortCandidate],
+    subagentConfig: { modelCount: 2, priorityCandidateIds: [] },
+  });
+
+  h.component.handleInput('\t');
+  selectRow(h, 'slot:1');
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Assign subagent slot 1'));
+
+  // Select candidate in model picker
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'));
+  assert.ok(h.text().includes('openai/gpt-5-codex-effort'));
+  assert.ok(h.text().includes('Default'));
+  assert.ok(h.text().includes('low'));
+  assert.ok(h.text().includes('medium'));
+  assert.ok(h.text().includes('high'));
+  assert.equal(h.subagentPatches.length, 0);
+
+  // Select 'medium' (Default -> low -> medium)
+  h.component.handleInput('\x1b[B');
+  h.component.handleInput('\x1b[B');
+  h.component.handleInput('\r');
+
+  assert.equal(h.subagentPatches.length, 1);
+  assert.deepEqual(h.subagentPatches[0], {
+    priorityCandidateIds: ['openai/gpt-5-codex-effort'],
+    modelEfforts: { 'openai/gpt-5-codex-effort': 'medium' },
+  });
+  assert.ok(h.text().includes('1. openai/gpt-5-codex-effort [medium]'));
+});
+
+test('DASH-022 (S1): re-selecting same model in Subagents allows changing effort and Default removes override', () => {
+  const effortCandidate: ModelCandidate = {
+    ...piCandidates[0],
+    id: piIds[0],
+    supportedEfforts: ['low', 'high'],
+  };
+  const h = harness({
+    subagentCandidates: [effortCandidate],
+    subagentConfig: {
+      modelCount: 2,
+      priorityCandidateIds: [piIds[0]],
+      modelEfforts: { [piIds[0]]: 'low', [piIds[1]]: 'high' },
+    },
+  });
+
+  h.component.handleInput('\t');
+  assert.ok(h.text().includes(`1. ${piIds[0]} [low]`));
+
+  selectRow(h, 'slot:1');
+  h.component.handleInput('\r');
+  h.component.handleInput('\r'); // Select same model
+
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'));
+  assert.ok(h.render(100).some(line => line.startsWith('→ low')));
+
+  // Switch to Default
+  h.component.handleInput('\x1b[A');
+  assert.ok(h.render(100).some(line => line.startsWith('→ Default')));
+  h.component.handleInput('\r');
+
+  assert.equal(h.subagentPatches.length, 1);
+  assert.deepEqual(h.subagentPatches[0], {
+    priorityCandidateIds: [piIds[0]],
+    modelEfforts: { [piIds[1]]: 'high' },
+  });
+  assert.ok(h.text().includes(`1. ${piIds[0]} [Default]`));
+});
+
+test('DASH-023 (S1): Subagents slots display saved effort or Default', () => {
+  const h = harness({
+    subagentConfig: {
+      modelCount: 3,
+      priorityCandidateIds: [piIds[0], piIds[1]],
+      modelEfforts: { [piIds[0]]: 'xhigh' },
+    },
+  });
+
+  h.component.handleInput('\t');
+  const text = h.text();
+  assert.ok(text.includes(`1. ${piIds[0]} [xhigh]`), text);
+  assert.ok(text.includes(`2. ${piIds[1]} [Default]`), text);
+  assert.ok(text.includes('3. (empty)'), text);
+});
+
+test('DASH-024 (S1): clearing Subagents slot via d preserves per-model overrides', () => {
+  const h = harness({
+    subagentConfig: {
+      modelCount: 2,
+      priorityCandidateIds: [piIds[0], piIds[1]],
+      modelEfforts: { [piIds[0]]: 'high', [piIds[1]]: 'low' },
+    },
+  });
+
+  h.component.handleInput('\t');
+  selectRow(h, 'slot:1');
+  h.component.handleInput('d');
+
+  assert.deepEqual(h.subagentPatches, [{ priorityCandidateIds: ['', piIds[1]] }]);
+  assert.equal(h.subagentConfig().modelEfforts?.[piIds[0]], 'high');
+  assert.equal(h.subagentConfig().modelEfforts?.[piIds[1]], 'low');
+});
+
+test('DASH-025 (S1): Subagents effort menu respects escape, stale session and failed saves', () => {
+  const h = harness({ subagentConfig: { modelCount: 2, priorityCandidateIds: [] } });
+  h.component.handleInput('\t');
+  selectRow(h, 'slot:1');
+  h.component.handleInput('\r');
+  h.component.handleInput('\r'); // Enter effort menu
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'));
+
+  // Escape returns to model picker without save
+  h.component.handleInput('\x1b');
+  assert.ok(h.text().includes('Assign subagent slot 1'));
+  assert.equal(h.subagentPatches.length, 0);
+
+  // Enter effort menu again
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'));
+
+  // Stale session closes without save
+  h.setBound(false);
+  h.component.handleInput('\r');
+  assert.equal(h.closedCount(), 1);
+  assert.equal(h.subagentPatches.length, 0);
+
+  // Failed save keeps view and reports error
+  const failed = harness({ subagentConfig: { modelCount: 2, priorityCandidateIds: [] }, failSubagentApply: true });
+  failed.component.handleInput('\t');
+  selectRow(failed, 'slot:1');
+  failed.component.handleInput('\r');
+  failed.component.handleInput('\r');
+  failed.component.handleInput('\r');
+  assert.equal(failed.subagentPatches.length, 0);
+  assert.equal(failed.errors.length, 1);
+  assert.ok(failed.text().includes('Select reasoning effort: slot 1'));
 });

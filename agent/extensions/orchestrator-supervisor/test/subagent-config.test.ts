@@ -392,3 +392,54 @@ test('SUBAGENT-CONFIG-010 (S4): a held lock refuses the write and leaves the sto
     assert.equal(updateSubagentConfig(s.cwd, { enabled: false }).enabled, false);
   } finally { s.close(); }
 });
+
+test('SUBAGENT-CONFIG-012 (S1, S2): modelEfforts is absent by default, and an old file without it stays absent', () => {
+  assert.equal(DEFAULT_SUBAGENT_CONFIG.modelEfforts, undefined);
+  assert.equal(validateSubagentConfig({ version: 1 }).modelEfforts, undefined);
+  assert.equal(validateSubagentConfig({ version: 1, enabled: true, modelCount: 6 }).modelEfforts, undefined);
+});
+
+test('SUBAGENT-CONFIG-013 (S1, S2): modelEfforts round-trips through update/load, keyed by full candidate ID', () => {
+  const s = scratch();
+  try {
+    const efforts = { 'cliproxyapi/main/gpt-6.1-sol': 'medium', 'openrouter/meta-llama/llama-3-70b': 'off' };
+    const saved = updateSubagentConfig(s.cwd, { modelEfforts: efforts });
+    assert.deepEqual(saved.modelEfforts, efforts);
+    const loaded = loadSubagentConfig(s.cwd);
+    assert.equal(loaded.source, 'file');
+    assert.deepEqual(loaded.config.modelEfforts, efforts);
+
+    // A patch to an unrelated field preserves the stored effort map untouched.
+    const afterPatch = updateSubagentConfig(s.cwd, { modelCount: 8 });
+    assert.deepEqual(afterPatch.modelEfforts, efforts);
+  } finally { s.close(); }
+});
+
+test('SUBAGENT-CONFIG-014 (S1, S2): modelEfforts validation never truncates an entry hidden by modelCount', () => {
+  const s = scratch();
+  try {
+    const efforts = { 'p/a': 'high', 'p/not-visible': 'low' };
+    const saved = updateSubagentConfig(s.cwd, { priorityCandidateIds: ['p/a', 'p/b', 'p/c'], modelCount: 2, modelEfforts: efforts });
+    assert.deepEqual(saved.modelEfforts, efforts);
+    assert.deepEqual(loadSubagentConfig(s.cwd).config.modelEfforts, efforts);
+  } finally { s.close(); }
+});
+
+test('SUBAGENT-CONFIG-015 (S1, S2): an unsupported effort value is refused before writing anything', () => {
+  const s = scratch();
+  try {
+    updateSubagentConfig(s.cwd, { enabled: true });
+    const before = readFileSync(s.path());
+    assert.throws(
+      () => updateSubagentConfig(s.cwd, { modelEfforts: { 'p/a': 'extreme' } as any }),
+      /unsupported effort/,
+    );
+    assert.deepEqual(readFileSync(s.path()), before);
+    assert.throws(() => validateSubagentConfig({ version: 1, modelEfforts: { 'p/a': 'nope' } }), /unsupported effort/);
+  } finally { s.close(); }
+});
+
+test('SUBAGENT-CONFIG-016 (S1, S2): a malformed modelEfforts root is refused like every other malformed field', () => {
+  assert.throws(() => validateSubagentConfig({ version: 1, modelEfforts: ['high'] }), /expected an object/);
+  assert.throws(() => validateSubagentConfig({ version: 1, modelEfforts: 'high' }), /expected an object/);
+});

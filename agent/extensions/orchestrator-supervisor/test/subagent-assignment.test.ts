@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { registerSubagentAssignment } from '../src/subagent-assignment.ts';
-import { resolveSubagentConfigPath, updateSubagentConfig } from '../src/subagent-config.ts';
+import { resolveSubagentConfigPath, selectSubagentConfigScope, updateSubagentConfig } from '../src/subagent-config.ts';
 
 /**
  * The adapter is a child-side lifecycle hook: it never touches the parent runtime, never
@@ -22,7 +22,7 @@ const ID_B = 'openrouter/llama-3-70b';
 const ID_IMAGE = 'openai/gpt-image-1';
 
 interface HarnessOptions {
-  config?: { enabled: boolean; modelCount: number; priorityCandidateIds: string[] } | false;
+  config?: { enabled: boolean; modelCount: number; priorityCandidateIds: string[]; modelEfforts?: Record<string, import('../src/model-effort.ts').ModelEffort> } | false;
   models?: any[];
   registry?: any;
   mode?: string;
@@ -524,7 +524,7 @@ test('SUBAGENT-ASSIGN-026 (S4): a dispose during async pool resolution never acq
 // Boundary: no unrequested changes
 // ---------------------------------------------------------------------------
 
-test('SUBAGENT-ASSIGN-027 (S1, S4): the adapter never calls setThinkingLevel and never mutates the environment', async () => {
+test('SUBAGENT-ASSIGN-027 (S1, S4): without an override the adapter preserves host effort and never mutates the environment', async () => {
   const h = childHarness({ config: config([ID_A]) });
   try {
     const envBefore = JSON.stringify(process.env.GENTLE_PI_AGENTS_CHILD ?? null);
@@ -702,4 +702,83 @@ test('SUBAGENT-ASSIGN-029 (S2, S4): a disabled configuration never touches the p
     await h.start();
     assert.deepEqual(h.reports, [], 'a disabled feature reports nothing and loads no pool');
   } finally { h.s.close(); }
+});
+
+
+test('child allocation reads the selected project or active-Pi global source and preserves runtime cwd', async () => {
+  const h = childHarness();
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(h.s.dir, 'active-pi');
+  try {
+    selectSubagentConfigScope(h.s.cwd, 'project'); updateSubagentConfig(h.s.cwd, config([ID_A]));
+    selectSubagentConfigScope(h.s.cwd, 'global'); updateSubagentConfig(h.s.cwd, config([ID_B]));
+    h.register(); await h.start();
+    assert.deepEqual(h.acquireCalls[0].ids, [ID_B]);
+    assert.equal(h.acquireCalls[0].cwd, h.s.cwd);
+    await h.settle();
+    selectSubagentConfigScope(h.s.cwd, 'project'); await h.beforeTurn();
+    assert.deepEqual(h.acquireCalls[1].ids, [ID_A]);
+    assert.equal(h.releaseCalls.length, 1);
+    await h.settle();
+    h.ctx.isProjectTrusted = () => false;
+    await h.beforeTurn();
+    assert.equal(h.acquireCalls.length, 2, 'an explicitly untrusted child must not allocate from project preferences');
+  } finally {
+    await h.shutdown(); h.s.close();
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+  }
+});
+
+
+test('effort assignment: apply only the selected model override after success and refresh it on the next allocation', async () => {
+  const h = childHarness({
+    config: { ...config([ID_A, ID_B]), modelEfforts: { [ID_A]: 'high', [ID_B]: 'low' } },
+    acquire: () => ({ token: 'selected-b', modelId: ID_B }),
+  });
+  try {
+    const order: string[] = [];
+    h.pi.setModel = async (model: any) => { order.push('model'); h.setModelCalls.push(model); return true; };
+    h.pi.setThinkingLevel = (level: string) => { order.push('effort'); h.setThinkingCalls.push([level]); };
+    h.register();
+    const before = h.s.configBytes();
+    await h.start();
+    assert.deepEqual(h.setModelCalls, [MODEL_B]);
+    assert.deepEqual(h.setThinkingCalls, [['low']]);
+    assert.deepEqual(order, ['model', 'effort']);
+    assert.equal(h.s.configBytes(), before);
+    updateSubagentConfig(h.s.cwd, { modelEfforts: { [ID_B]: 'medium' } });
+    await h.beforeTurn();
+    assert.deepEqual(h.setThinkingCalls, [['low']], 'an active lease must not change mid-turn');
+    await h.settle(); await h.beforeTurn();
+    assert.deepEqual(h.setThinkingCalls, [['low'], ['medium']]);
+    assert.equal(h.acquireCalls.length, 2);
+    assert.equal(h.releaseCalls.length, 1);
+    assert.deepEqual(h.reports, []);
+  } finally { await h.shutdown(); h.s.close(); }
+});
+
+test('effort assignment: rejected or stale model application never changes effort', async () => {
+  for (const outcome of ['false', 'throw', 'agent_settled', 'session_shutdown']) {
+    let finish!: (value: boolean) => void;
+    const h = childHarness({
+      config: { ...config([ID_A]), modelEfforts: { [ID_A]: 'low' } },
+      setModelResult: async () => {
+        if (outcome === 'false') return false;
+        if (outcome === 'throw') throw new Error('secret provider body');
+        return new Promise<boolean>(resolve => { finish = resolve; });
+      },
+    });
+    try {
+      h.register(); const before = h.s.configBytes(); const start = h.start();
+      if (outcome === 'agent_settled' || outcome === 'session_shutdown') {
+        await tick(); await h.fire(outcome); finish(true);
+      }
+      await start;
+      assert.deepEqual(h.setThinkingCalls, [], outcome);
+      assert.equal(h.setModelCalls.length, 1);
+      assert.equal(h.releaseCalls.length, 1);
+      assert.equal(h.s.configBytes(), before);
+      assert.ok(!JSON.stringify(h.reports).includes('secret provider body'));
+    } finally { await h.shutdown(); h.s.close(); }
+  }
 });

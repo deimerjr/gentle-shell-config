@@ -7,8 +7,17 @@ The supervisor rotates the parent session and selects its model automatically. `
 1. Load the extension with `/reload` after current work has settled.
 2. Open `/supervisor` in a trusted interactive parent session.
 3. In **Orchestrator**, set **Enabled**, **Auto rotation** and **Auto model switch** independently.
-4. Set the model count from **2 to 10**; the default is **5**. Assign the ordered model slots from Pi's chat-model catalogue.
+4. Set the model count from **2 to 10**; the default is **5**. Assign the ordered model slots from Pi's chat-model catalogue using a two-stage selection: selecting a model opens a second effort menu displaying **Default** along with the model's host-proven supported reasoning efforts (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Confirming an effort persists the model ID and effort override atomically in a single write. Escape in the effort menu returns to the model picker without saving; Escape in the model picker closes it. Selecting an already assigned model allows adjusting its effort. Choosing **Default** removes only that model's override.
 5. Adjust rotation/quota thresholds, retry limit, cooldown and polling interval. Changes save immediately and reach the running supervisor without another reload.
+6. In either tab, highlight **Configuration source**: press ← for **Project**, → for **Global**, or Enter/click to switch. Each tab remembers its own choice for this project and shows its effective file path. Opening the panel does not change the source.
+
+**Reasoning efforts and capability discovery:** Reasoning efforts are persisted per model ID in the selected configuration file (`modelEfforts` map in `supervisor.json` and `subagents.json`). There is no automatic migration: older files without `modelEfforts` remain valid and absent maps remain absent until an explicit effort is saved. Absent overrides preserve existing default runtime behavior (Orchestrator uses `high`, Subagents preserves host defaults), labeled as `Default`. The UI never calls providers or guesses capabilities from model names; unknown capabilities expose `Default` only. Clearing a slot (or pressing `d` in Subagents) immediately clears that slot position while preserving per-model overrides.
+
+**Project** stores preferences in `<project-root>/.pi/orchestrator-supervisor/`; **Global** uses `<active-Pi-agent-dir>/orchestrator-supervisor/`, resolved by Pi's public `getAgentDir()` API and respecting `PI_CODING_AGENT_DIR`. There is no hardcoded global home path. Orchestrator can use Project while Subagents uses Global, or vice versa. Global edits affect other projects that explicitly select Global for that tab; unrelated projects retain their own source.
+
+Until you choose a source, **Existing (unchanged)** preserves the previous runtime-backed preferences and defaults. Selecting a source loads that destination's complete settings, or defaults if absent: it does not copy, merge, delete or overwrite another source. Switching back restores that source's saved model list, including hidden slots. Source selection alone never acknowledges uncertain effects or clears a safety fault. Invalid destinations refuse selection without changing the current choice.
+
+Project preferences resolve from the nearest Git root, including worktrees; without Git, the nearest existing `.pi` directory is used, otherwise the working directory. Runtime/session identities still use the original working directory. Source choices are local runtime metadata, not versioned preferences: another machine must explicitly select Project to use a checked-in preference file. Repositories must be trusted before the panel or child assignment consumes project settings. Read-only destinations report write errors rather than silently saving elsewhere.
 
 Use Tab or Shift+Tab to switch tabs, or click a tab. Use ↑↓ and Page Up/Page Down to navigate, ←→ or the displayed `[-]`/`[+]` controls to adjust values, Enter to edit a slot or flip a switch, and Escape to close. Slot pickers support filtering and keyboard navigation. Opening or switching tabs does not write settings, select a model or start a chat turn.
 
@@ -100,13 +109,24 @@ Legacy pause/cancel flags and separate model-routing preferences no longer contr
 
 ## Configuration and storage
 
-Per-project configuration and runtime documents live under `.runtime/<project identity>/` (or `GENTLE_SUPERVISOR_RUNTIME_DIR`):
+Preferences have three storage locations; only Project/Global are selectable new destinations:
+
+| Source | Preference directory |
+| --- | --- |
+| Existing (unchanged) | Original `.runtime/<cwd identity>/` (or `GENTLE_SUPERVISOR_RUNTIME_DIR`), until the first explicit selection. |
+| Project | `<project-root>/.pi/orchestrator-supervisor/` (using Pi's project directory name). |
+| Global | `<active-Pi-agent-dir>/orchestrator-supervisor/`, never relative to the extension installation. |
+
+Each directory may contain independent `supervisor.json` and `subagents.json` files. The selected file is authoritative; fields are never merged across sources. Preferences use locked atomic private writes. Runtime documents remain under `.runtime/<identity>/` (or `GENTLE_SUPERVISOR_RUNTIME_DIR`):
 
 | File | Contents |
 | --- | --- |
-| `supervisor.json` | Existing Orchestrator `enabled`, `autoRotate`, `autoSwitchModel`, `modelCount`, full `priorityCandidateIds`, thresholds, retries, cooldown and polling. |
-| `subagents.json` | Version 1, `enabled`, `modelCount` (2–20), ordered `priorityCandidateIds` with unique nonempty model IDs. Empty strings preserve vacant slot positions. Defaults: disabled, count 5, empty list. |
-| `subagent-pool.json` | Version 1 runtime leases (opaque token, model, PID, session, timestamp) and tie-rotation counters. Not user preferences; invalid state is reported without overwriting. |
+| `supervisor.json` | Orchestrator preferences at the selected location (legacy runtime location until explicit selection): `enabled`, `autoRotate`, `autoSwitchModel`, `modelCount`, full `priorityCandidateIds`, optional per-model `modelEfforts`, thresholds, retries, cooldown and polling. |
+| `subagents.json` | Version 1, `enabled`, `modelCount` (2–20), ordered `priorityCandidateIds` with unique nonempty model IDs, optional per-model `modelEfforts`. Empty strings preserve vacant slot positions. Defaults: disabled, count 5, empty list. |
+| `subagent-pool.json` | Version 1 runtime leases (opaque token, model, PID, session, timestamp) and tie-rotation counters. Always runtime-backed, even when preferences are global/project-local. Not user preferences; invalid state is reported without overwriting. |
+| `supervisor-scope.json`, `subagents-scope.json` | Independent version-1 source choices (`project` or `global`) keyed by project root in runtime storage. Invalid metadata fails closed for the affected tab and is never silently replaced. |
+
+Session locks, mutation journals and session state are not relocated. Project configuration writes may briefly create `.lock` and private `.tmp` files beside preferences; successful writes clean them up. The extension does not modify `.gitignore`.
 
 This runtime `subagents.json` is **not** `agent/subagents.json`: the latter is the host's existing per-agent model profile configuration and is not modified. Panel saves use locked atomic writes with private permissions; rejected edits leave saved configuration unchanged.
 
@@ -115,7 +135,8 @@ A missing file uses documented defaults: enabled, both capabilities on, count 5,
 | Environment variable | Purpose |
 | --- | --- |
 | `GENTLE_SUPERVISOR_DISABLED=1` | Disable runtime initialization. |
-| `GENTLE_SUPERVISOR_RUNTIME_DIR` | Override the extension's default `.runtime/` directory. |
+| `GENTLE_SUPERVISOR_RUNTIME_DIR` | Override runtime storage, legacy preferences and per-project source-choice metadata; does not relocate explicitly selected Project/Global preferences. |
+| `PI_CODING_AGENT_DIR` | Pi's active agent directory override, honored for Global preferences through the host resolver. Without the host API, only an explicit override is accepted; no global default is guessed. |
 | `CLIPROXYAPI_BASE_URL` | Existing management endpoint; default `http://127.0.0.1:8317`, normalizing a trailing `/v1`. |
 | `CLIPROXYAPI_MANAGEMENT_KEY` | Existing management credential inherited from the environment. |
 | `CLIPROXYAPI_API_KEY` | Existing fallback credential inherited from the environment. |

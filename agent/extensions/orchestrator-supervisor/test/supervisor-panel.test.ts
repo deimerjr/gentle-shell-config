@@ -187,11 +187,16 @@ test('PANEL-003 (S1): the keyboard path assigns a slot via the filtered picker a
   assert.ok(!h.text().includes(idMain), h.text());
 
   h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 2'), h.text());
+  assert.deepEqual(h.patches, [], 'model selection alone does not save until effort is confirmed');
+
+  h.component.handleInput('\r');
   assert.deepEqual(h.patches, [{ priorityCandidateIds: [idMain, idSecond] }]);
   assert.equal(h.closedCount(), 0);
 
   const back = h.text();
   assert.ok(!back.includes('Assign priority slot'), back);
+  assert.ok(!back.includes('Select reasoning effort'), back);
   assert.ok(back.includes(`1. ${idMain}`), back);
   assert.ok(back.includes(`2. ${idSecond}`), back);
 });
@@ -626,4 +631,166 @@ test('PANEL-018 (S3): a filter that matches no model reports it instead of a bla
   for (let index = 0; index < 3; index++) h.component.handleInput('\x7f');
   assert.ok(!/no model matches/.test(h.text()), h.text());
   assert.ok(h.text().includes(idMain), h.text());
+});
+
+test('PANEL-019 (S1): effort menu opens after model selection and persists ID plus effort atomically', () => {
+  const effortCandidate: ModelCandidate = {
+    ...catalog[0],
+    id: 'cliproxyapi/effort/gpt-6.1-sol',
+    supportedEfforts: ['low', 'medium', 'high', 'xhigh'],
+  };
+  const h = harness({ candidates: [effortCandidate, ...catalog], config: { modelCount: 2, priorityCandidateIds: [] } });
+
+  selectRow(h, 'slot:1');
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Assign priority slot 1'));
+
+  // Select the effort candidate in model picker
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'));
+  assert.ok(h.text().includes('cliproxyapi/effort/gpt-6.1-sol'));
+  assert.ok(h.text().includes('Default'));
+  assert.ok(h.text().includes('low'));
+  assert.ok(h.text().includes('medium'));
+  assert.ok(h.text().includes('high'));
+  assert.ok(h.text().includes('xhigh'));
+  assert.equal(h.patches.length, 0, 'no save before effort confirmation');
+
+  // Step down to 'medium' (Default -> low -> medium)
+  h.component.handleInput('\x1b[B'); // low
+  h.component.handleInput('\x1b[B'); // medium
+  h.component.handleInput('\r'); // confirm
+
+  assert.equal(h.patches.length, 1);
+  assert.deepEqual(h.patches[0], {
+    priorityCandidateIds: ['cliproxyapi/effort/gpt-6.1-sol'],
+    modelEfforts: { 'cliproxyapi/effort/gpt-6.1-sol': 'medium' },
+  });
+  assert.ok(h.text().includes('1. cliproxyapi/effort/gpt-6.1-sol [medium]'));
+});
+
+test('PANEL-020 (S1): re-selecting same model allows changing effort; Default removes override', () => {
+  const effortCandidate: ModelCandidate = {
+    ...catalog[0],
+    id: idMain,
+    supportedEfforts: ['low', 'medium', 'high'],
+  };
+  const h = harness({
+    candidates: [effortCandidate],
+    config: {
+      modelCount: 2,
+      priorityCandidateIds: [idMain],
+      modelEfforts: { [idMain]: 'low', [idSecond]: 'high' },
+    },
+  });
+
+  assert.ok(h.text().includes(`1. ${idMain} [low]`));
+
+  // Open slot 1 and select the same model
+  selectRow(h, 'slot:1');
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Assign priority slot 1'));
+  h.component.handleInput('\r');
+
+  // Effort menu opens, prior override ('low') is highlighted (index 1)
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'));
+  assert.ok(h.render(100).some(line => line.startsWith('→ low')));
+
+  // Move up to Default (index 0) and confirm
+  h.component.handleInput('\x1b[A');
+  assert.ok(h.render(100).some(line => line.startsWith('→ Default')));
+  h.component.handleInput('\r');
+
+  // Default removes only that model's override; other overrides survive
+  assert.equal(h.patches.length, 1);
+  assert.deepEqual(h.patches[0], {
+    priorityCandidateIds: [idMain],
+    modelEfforts: { [idSecond]: 'high' },
+  });
+  assert.ok(h.text().includes(`1. ${idMain} [Default]`));
+});
+
+test('PANEL-021 (S1): Escape in effort menu returns to model picker without save; Escape in picker closes', () => {
+  const h = harness({ config: { modelCount: 2, priorityCandidateIds: [] } });
+
+  selectRow(h, 'slot:1');
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Assign priority slot 1'));
+
+  // Enter effort menu
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'));
+  assert.equal(h.patches.length, 0);
+
+  // Escape returns to model picker
+  h.component.handleInput('\x1b');
+  assert.ok(h.text().includes('Assign priority slot 1'));
+  assert.ok(!h.text().includes('Select reasoning effort'));
+  assert.equal(h.patches.length, 0);
+
+  // Escape closes picker (returns to rows view)
+  h.component.handleInput('\x1b');
+  assert.ok(!h.text().includes('Assign priority slot'));
+  assert.equal(h.closedCount(), 0);
+  assert.equal(h.patches.length, 0);
+
+  // Escape in rows view closes panel
+  h.component.handleInput('\x1b');
+  assert.equal(h.closedCount(), 1);
+  assert.equal(h.patches.length, 0);
+});
+
+test('PANEL-022 (S1): clearing slot drops slot immediately and preserves per-model overrides', () => {
+  const h = harness({
+    config: {
+      modelCount: 2,
+      priorityCandidateIds: [idMain, idSecond],
+      modelEfforts: { [idMain]: 'high', [idSecond]: 'low' },
+    },
+  });
+
+  selectRow(h, 'slot:1');
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Assign priority slot 1'));
+
+  // Move down to 'clear (drop slot 1)' and confirm
+  let guard = 0;
+  while (!h.render(100).some(line => line.startsWith('→ clear')) && guard < 20) {
+    h.component.handleInput('\x1b[B');
+    guard++;
+  }
+  assert.ok(h.render(100).some(line => line.startsWith('→ clear')));
+  h.component.handleInput('\r');
+
+  // Clear is immediate, does NOT open effort menu, and leaves modelEfforts untouched
+  assert.deepEqual(h.patches, [{ priorityCandidateIds: [idSecond] }]);
+  assert.equal(h.current().modelEfforts?.[idMain], 'high');
+  assert.equal(h.current().modelEfforts?.[idSecond], 'low');
+});
+
+test('PANEL-023 (S1): unbound panel closes without writing from effort menu', () => {
+  const h = harness({ config: { modelCount: 2, priorityCandidateIds: [] } });
+  selectRow(h, 'slot:1');
+  h.component.handleInput('\r');
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'));
+
+  h.setBound(false);
+  h.component.handleInput('\r');
+  assert.equal(h.closedCount(), 1);
+  assert.equal(h.patches.length, 0, 'no write after unbind in effort menu');
+});
+
+test('PANEL-024 (S1): refused write during effort confirmation reports error and keeps view open', () => {
+  const h = harness({ config: { modelCount: 2, priorityCandidateIds: [] }, failApply: true });
+  selectRow(h, 'slot:1');
+  h.component.handleInput('\r');
+  h.component.handleInput('\r');
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'));
+
+  h.component.handleInput('\r');
+  assert.equal(h.patches.length, 0);
+  assert.equal(h.errors.length, 1);
+  assert.ok(h.text().includes('Select reasoning effort: slot 1'));
+  assert.equal(h.closedCount(), 0);
 });

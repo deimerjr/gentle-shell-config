@@ -4,22 +4,28 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { updateSubagentConfig, resolveSubagentConfigPath } from '../src/subagent-config.ts';
+import { updateSubagentConfig, resolveSubagentConfigPath, selectSubagentConfigScope } from '../src/subagent-config.ts';
+import { computeFlowIdentity, resolveSupervisorDir } from '../src/config.ts';
 
 const extensionPath = fileURLToPath(new URL('../index.ts', import.meta.url));
 const providerPath = fileURLToPath(new URL('./fixtures/assignment-provider.ts', import.meta.url));
 const provider = 'supervisor-assignment-test';
 
 /** Real Pi RPC startup, with isolated settings and a registry-only offline provider. */
-test('actual RPC children balance selected models before any provider request; other RPC sessions stay unchanged', { timeout: 25000 }, async () => {
+for (const scope of ['legacy', 'project', 'global'] as const) {
+test(`actual RPC children use ${scope} preferences and balance before any provider request; other RPC sessions stay unchanged`, { timeout: 25000 }, async () => {
   const root = mkdtempSync(resolve('.tmp-assignment-rpc-'));
   const home = join(root, 'home');
   const project = join(root, 'project');
   const agentDir = join(home, 'agent');
   const runtime = join(root, 'runtime');
   for (const path of [home, project, agentDir, join(root, 'tmp')]) mkdirSync(path, { recursive: true });
+  // A nested fixture must not inherit the enclosing repository's preference root.
+  mkdirSync(join(project, '.git'));
   const oldRuntime = process.env.GENTLE_SUPERVISOR_RUNTIME_DIR;
+  const oldAgent = process.env.PI_CODING_AGENT_DIR;
   process.env.GENTLE_SUPERVISOR_RUNTIME_DIR = runtime;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   const children: Array<{ close: () => Promise<void> }> = [];
   const events: any[] = [];
   let stderr = '';
@@ -98,6 +104,8 @@ test('actual RPC children balance selected models before any provider request; o
     return { model: response.data.model.id as string, close };
   };
   try {
+    if (scope !== 'legacy') selectSubagentConfigScope(project, scope);
+    if (scope === 'project') assert.equal(resolveSubagentConfigPath(project), join(project, '.pi', 'orchestrator-supervisor', 'subagents.json'), 'project preferences must stay inside the isolated fixture');
     updateSubagentConfig(project, {
       enabled: true, modelCount: 3,
       priorityCandidateIds: ['', `${provider}/alpha`, `${provider}/beta`, `${provider}/baseline`],
@@ -106,7 +114,7 @@ test('actual RPC children balance selected models before any provider request; o
     const configBefore = readFileSync(configPath, 'utf8');
     const ordinary = await start(false);
     assert.equal(ordinary.model, 'baseline', 'ordinary RPC must retain its configured model');
-    const poolPath = join(dirname(configPath), 'subagent-pool.json');
+    const poolPath = join(resolveSupervisorDir(computeFlowIdentity(project)), 'subagent-pool.json');
     assert.equal(existsSync(poolPath), false, 'ordinary RPC must not create assignment state');
     const first = await start(true);
     assert.ok(['alpha', 'beta'].includes(first.model), `first child selected ${first.model}; ${stderr}`);
@@ -130,7 +138,10 @@ test('actual RPC children balance selected models before any provider request; o
     } finally {
       if (oldRuntime === undefined) delete process.env.GENTLE_SUPERVISOR_RUNTIME_DIR;
       else process.env.GENTLE_SUPERVISOR_RUNTIME_DIR = oldRuntime;
+      if (oldAgent === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = oldAgent;
       rmSync(root, { recursive: true, force: true });
     }
   }
 });
+}

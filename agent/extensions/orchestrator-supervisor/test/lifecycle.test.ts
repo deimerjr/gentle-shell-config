@@ -7,7 +7,8 @@ import { dirname, join } from 'node:path';
 import extension from '../index.ts';
 import { FlowJournal } from '../src/journal.ts';
 import { computeFlowIdentity } from '../src/config.ts';
-import { resolveSupervisorConfigPath, isSupervisorEnabled, loadSupervisorConfig, updateSupervisorConfig, type SupervisorConfig } from '../src/supervisor-config.ts';
+import { resolveSupervisorConfigPath, selectSupervisorConfigScope, isSupervisorEnabled, loadSupervisorConfig, updateSupervisorConfig, type SupervisorConfig } from '../src/supervisor-config.ts';
+import { loadSubagentConfig, resolveSubagentConfigPath } from '../src/subagent-config.ts';
 import { getPanelRowIds } from '../src/supervisor-panel.ts';
 import { MockCpamcServer } from './fixtures/mock-cpamc.ts';
 import { fakeKeybindings, fakeLib, identityTheme } from './fixtures/fake-tui.ts';
@@ -193,6 +194,8 @@ test('subagent dashboard saves real JSON and reopens independently of Orchestrat
       for (const character of id) panel.handleInput(character);
       assert.match(panelText(panel), new RegExp(id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
       panel.handleInput('\r');
+      assert.match(panelText(panel), /Select reasoning effort/);
+      panel.handleInput('\r'); // Confirm Default; neither stage may save alone.
     };
     assign(1, 'cliproxyapi/same-account/model-a');
     assign(2, 'cliproxyapi/same-account/model-b');
@@ -230,6 +233,8 @@ test('subagent dashboard saves real JSON and reopens independently of Orchestrat
     panelEnter(afterClear, 'slot:1', rows);
     for (const character of 'same-account/model-a') afterClear.handleInput(character);
     assert.match(panelText(afterClear), /cliproxyapi\/same-account\/model-a/);
+    afterClear.handleInput('\r');
+    assert.match(panelText(afterClear), /Select reasoning effort/);
     afterClear.handleInput('\r');
     assert.deepEqual(JSON.parse(readFileSync(subagentPath, 'utf8')).priorityCandidateIds,
       ['cliproxyapi/same-account/model-a', 'cliproxyapi/same-account/model-b']);
@@ -669,6 +674,9 @@ async function quotaHost(config: Partial<SupervisorConfig> = {}, serverOptions: 
   h.ctx.model = { provider: 'cliproxyapi', id: 'main/gpt-6.1-sol', contextWindow: 272000 };
   h.ctx.modelRegistry = { find: (provider: string, id: string) => ({ provider, id, contextWindow: 272000 }) };
   h.pi.setModel = async (model: any) => { h.ctx.model = model; return true; };
+  // Records startup routing efforts; later tests may still replace this recorder.
+  const startupEfforts: string[] = [];
+  h.pi.setThinkingLevel = (level: string) => { startupEfforts.push(level); };
   let tick: any;
   let intervalMs: number | undefined;
   const realInterval = globalThis.setInterval;
@@ -677,7 +685,7 @@ async function quotaHost(config: Partial<SupervisorConfig> = {}, serverOptions: 
   }) as any;
   try { await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx); }
   finally { globalThis.setInterval = realInterval; }
-  return { ...h, server, tick: async () => { await tick(); }, intervalMs: () => intervalMs,
+  return { ...h, server, startupEfforts, tick: async () => { await tick(); }, intervalMs: () => intervalMs,
     async close() { await h.close(); await server.stop(); } };
 }
 const failedMessage = { role: 'assistant', stopReason: 'error', errorMessage: 'insufficient_quota' };
@@ -1216,12 +1224,11 @@ test('T3/S5: a malformed config keeps the supervisor disabled, reports why and i
     const diagnostic = h.notices.find(([message]) => /Malformed supervisor configuration/.test(message));
     assert.ok(diagnostic, 'the failure must be reported');
     assert.equal(diagnostic[1], 'warning');
-    // The panel refuses to open over an unusable file instead of rewriting it.
-    let customCalls = 0;
-    const ctx = { ...h.ctx, ui: { ...h.ctx.ui, custom: async () => { customCalls += 1; return undefined; } } };
-    await h.commands.get('supervisor').handler('', ctx);
-    assert.equal(customCalls, 0, 'the panel must not open over an unusable file');
-    assert.ok(h.notices.some(([message]) => /panel unavailable/.test(message)), JSON.stringify(h.notices));
+    // A damaged source stays read-only while both tabs and source selection remain usable.
+    const panel = await panelFor(h);
+    assert.match(panelText(panel), /configuration error:.*invalid JSON/);
+    panel.handleInput('\r');
+    assert.equal(loadSupervisorConfig(h.dir).source, 'invalid');
     assert.equal(readFileSync(path, 'utf8'), raw, 'a malformed file is never rewritten');
     assert.equal(h.sent.length, 0);
   } finally { await h.close(); }
@@ -1376,20 +1383,21 @@ test('T6/S4: the panel opens with the supervisor off, switches it on and off, an
   }
 });
 
-test('T6/S4: an unusable stored config makes the panel refuse to open and never rewrite', async () => {
-  const h = host();
+test('T6/S4: an unusable source remains read-only without blocking the other tab', async () => {
+  const h = host('tui', {}, { panelLib: fakeLib });
   try {
     const path = resolveSupervisorConfigPath(h.dir);
     mkdirSync(dirname(path), { recursive: true });
     const raw = '{ not json';
     writeFileSync(path, raw);
 
-    let customCalls = 0;
-    const ctx = { ...h.ctx, ui: { ...h.ctx.ui, custom: async () => { customCalls += 1; return undefined; } } };
-    await h.commands.get('supervisor').handler('', ctx);
-    assert.equal(customCalls, 0, 'the panel must not open over an unusable file');
-    assert.ok(h.notices.some(([message]) => /panel unavailable/.test(message)), JSON.stringify(h.notices));
+    const panel = await panelFor(h);
+    assert.match(panelText(panel), /configuration error:.*invalid JSON/);
+    panel.handleInput('\r');
     assert.equal(readFileSync(path, 'utf8'), raw, 'the file is untouched');
+    panel.handleInput('\t');
+    assert.match(panelText(panel), /Subagent router configuration/);
+    assert.doesNotMatch(panelText(panel), /configuration error:/);
   } finally { await h.close(); }
 });
 
@@ -1624,3 +1632,177 @@ test('S1/S2: 3 failures on an unselected active model fail over to the configure
     assert.equal(h.sent[0][1]?.triggerTurn, true);
   } finally { await h.close(); }
 });
+
+
+test('configuration scopes: public panel persists independent sources, reopens, and applies runtime switches without acknowledging effects', async () => {
+  const h = host('tui', {}, { panelLib: fakeLib });
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(h.dir, 'active-pi');
+  try {
+    updateSupervisorConfig(h.dir, { enabled: false });
+    const legacy = resolveSupervisorConfigPath(h.dir), before = readFileSync(legacy, 'utf8');
+    selectSupervisorConfigScope(h.dir, 'project');
+    updateSupervisorConfig(h.dir, { enabled: false, modelCount: 3 });
+    selectSupervisorConfigScope(h.dir, 'global');
+    updateSupervisorConfig(h.dir, { enabled: true, autoSwitchModel: false, modelCount: 2 });
+    await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx);
+    await h.hooks.get('tool_call')({ toolCallId: 'scope-write', toolName: 'write', input: { path: 'example.txt', content: 'pending' } }, h.ctx);
+    await h.hooks.get('session_shutdown')({ reason: 'reload' }, h.ctx);
+    await h.hooks.get('session_start')({ reason: 'reload' }, h.ctx);
+    const panel = await panelFor(h);
+    const scopeRows = ['scope', ...rowsFor(h)];
+    assert.match(panelText(panel), /Configuration source: Global/);
+    panelHighlight(panel, 'scope', scopeRows); panel.handleInput('\x1b[D');
+    assert.match(panelText(panel), /Configuration source: Project/);
+    assert.equal(loadSupervisorConfig(h.dir).config.enabled, false);
+    assert.match(panelText(panel), /off for this project/);
+    panel.handleInput('\x1b[C');
+    assert.equal(loadSupervisorConfig(h.dir).config.enabled, true);
+    assert.match(panelText(panel), /uncertain effects: 1/);
+    const blocked = await h.hooks.get('tool_call')({ toolCallId: 'rejected', toolName: 'write', input: {} }, h.ctx);
+    assert.equal(blocked?.block, true, 'scope changes must never acknowledge uncertain effects');
+    panel.handleInput('\t');
+    panelHighlight(panel, 'scope', ['scope', 'toggle', 'modelCount']); panel.handleInput('\r');
+    assert.match(panelText(panel), /Configuration source: Project/);
+    panelEnter(panel, 'modelCount', ['scope', 'toggle', 'modelCount']); panel.handleInput('\x1b[C');
+    assert.equal(loadSubagentConfig(h.dir).config.modelCount, 6);
+    assert.equal(resolveSubagentConfigPath(h.dir), join(h.dir, '.pi', 'orchestrator-supervisor', 'subagents.json'));
+    const reopened = await panelFor(h);
+    assert.match(panelText(reopened), /Configuration source: Global/);
+    reopened.handleInput('\t');
+    assert.match(panelText(reopened), /Configuration source: Project/);
+    assert.match(panelText(reopened), /Model count\s+\[-\] 6/);
+    assert.equal(readFileSync(legacy, 'utf8'), before);
+    assert.equal(h.sent.length, 0);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    await h.close();
+  }
+});
+
+
+test('effort selection: public dashboard saves Default atomically and restores it on reopen', async () => {
+  const h = host('tui', {}, { panelLib: fakeLib });
+  try {
+    updateSupervisorConfig(h.dir, { enabled: false });
+    const candidate = { provider: 'test', id: 'reasoner', reasoning: true };
+    h.ctx.modelRegistry = { getAvailable: () => [candidate], getAll: () => [candidate] };
+    const panel = await panelFor(h);
+    const rows = ['scope', ...rowsFor(h)];
+    const before = readFileSync(resolveSupervisorConfigPath(h.dir), 'utf8');
+    panelEnter(panel, 'slot:1', rows);
+    for (const character of 'test/reasoner') panel.handleInput(character);
+    panel.handleInput('\r');
+    assert.match(panelText(panel), /Select reasoning effort/);
+    assert.equal(readFileSync(resolveSupervisorConfigPath(h.dir), 'utf8'), before, 'choosing a model alone must not save');
+    // Standalone node has no host capability module: the honest available option is Default.
+    assert.match(panelText(panel), /Default/);
+    panel.handleInput('\r');
+    assert.deepEqual(loadSupervisorConfig(h.dir).config.priorityCandidateIds, ['test/reasoner']);
+    assert.equal(loadSupervisorConfig(h.dir).config.modelEfforts, undefined);
+    const reopened = await panelFor(h);
+    assert.match(panelText(reopened), /test\/reasoner \[Default\]/);
+    reopened.handleInput('\t');
+    panelEnter(reopened, 'slot:1', ['scope', 'toggle', 'modelCount', 'slot:1']);
+    for (const character of 'test/reasoner') reopened.handleInput(character);
+    reopened.handleInput('\r');
+    assert.match(panelText(reopened), /Select reasoning effort/);
+    reopened.handleInput('\x1b');
+    assert.match(panelText(reopened), /Assign subagent slot/);
+    assert.equal(loadSubagentConfig(h.dir).source, 'default', 'cancel must not create a child preference file');
+  } finally { await h.close(); }
+});
+
+
+test('effort overrides: provider recovery applies the effort of the actual failover model only', async () => {
+  const target = 'cliproxyapi/second/gpt-6.1-sol';
+  const h = await quotaHost({ modelEfforts: { [target]: 'low', 'cliproxyapi/main/gpt-6.1-sol': 'xhigh' } });
+  const efforts: string[] = [];
+  h.pi.setThinkingLevel = (level: string) => { efforts.push(level); };
+  try {
+    await h.hooks.get('before_agent_start')({ messageType: 'user', prompt: 'authorized work' }, h.ctx);
+    await h.hooks.get('turn_end')({ message: failedMessage }, h.ctx);
+    await h.hooks.get('agent_before_settle')(errorBoundary(), h.ctx);
+    await h.hooks.get('agent_settled')({ aborted: false }, h.ctx);
+    assert.deepEqual(efforts, [], 'no effort change while no selected model can be applied');
+    h.server.options.secondWhamUsedPercentPrimary = 10;
+    await h.tick();
+    assert.equal(h.ctx.model.id, 'second/gpt-6.1-sol');
+    assert.deepEqual(efforts, ['low'], 'failover must use its own stored override, not the outgoing model effort');
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.sent[0][0].customType, 'supervisor-provider-recovery');
+    assert.equal(h.sent[0][1].triggerTurn, true);
+  } finally { await h.close(); }
+});
+
+
+test('effort enrichment: session replaced during subagent capability lookup never opens a stale panel', async () => {
+  const h = host('tui', {}, { panelLib: fakeLib });
+  try {
+    updateSupervisorConfig(h.dir, { enabled: false });
+    const path = resolveSupervisorConfigPath(h.dir);
+    const before = readFileSync(path, 'utf8');
+    const model = { provider: 'test', id: 'reasoner', reasoning: true };
+    let trusted = true;
+    let customCalls = 0;
+    let finds = 0;
+    h.ctx.isProjectTrusted = () => trusted;
+    h.ctx.modelRegistry = {
+      getAvailable: () => [model], getAll: () => [model],
+      find: () => { if (++finds === 2) trusted = false; return model; },
+    };
+    h.ctx.ui.custom = async () => { customCalls++; };
+    await h.commands.get('supervisor').handler('', h.ctx);
+    assert.equal(finds, 2, 'both tab catalogues must be enriched');
+    assert.equal(customCalls, 0, 'the context must be rechecked after the last await');
+    assert.equal(readFileSync(path, 'utf8'), before);
+    assert.equal(loadSubagentConfig(h.dir).source, 'default');
+  } finally { await h.close(); }
+});
+
+
+test('effort overrides: a live panel Default edit applies at the next successful model switch without reload', async () => {
+  const target = 'cliproxyapi/second/gpt-6.1-sol';
+  const h = await quotaHost({ modelEfforts: { [target]: 'low' } });
+  const efforts: string[] = [];
+  h.pi.setThinkingLevel = (level: string) => { efforts.push(level); };
+  try {
+    h.ctx.modelRegistry.getAvailable = () => ROUTING_SLOTS.map(id => ({ provider: 'cliproxyapi', id: id.slice('cliproxyapi/'.length) }));
+    const panel = await panelFor(h);
+    assert.match(panelText(panel), /second\/gpt-6.1-sol \[low\]/);
+    panelEnter(panel, 'slot:2', ['scope', ...rowsFor(h)]);
+    for (const character of target) panel.handleInput(character);
+    panel.handleInput('\r');
+    assert.match(panelText(panel), /Select reasoning effort/);
+    panel.handleInput('\r'); // Default: standalone host cannot prove explicit capabilities.
+    assert.deepEqual(loadSupervisorConfig(h.dir).config.modelEfforts, {});
+    assert.deepEqual(efforts, [], 'a panel save must not mutate the current model effort');
+    await h.hooks.get('before_agent_start')({ messageType: 'user', prompt: 'authorized work' }, h.ctx);
+    await h.hooks.get('turn_end')({ message: failedMessage }, h.ctx);
+    await h.hooks.get('agent_before_settle')(errorBoundary(), h.ctx);
+    await h.hooks.get('agent_settled')({ aborted: false }, h.ctx);
+    h.server.options.secondWhamUsedPercentPrimary = 10;
+    await h.tick();
+    assert.equal(h.ctx.model.id, 'second/gpt-6.1-sol');
+    assert.deepEqual(efforts, ['high'], 'the live runtime must use Default, not the obsolete low map');
+  } finally { await h.close(); }
+});
+
+/**
+ * Startup routing (S1, S2): replaces the former registry-only runtime fixture, whose failed
+ * account discovery made startup routing skip the switch entirely. Here the second account
+ * has headroom, so startup really switches and the effort line is exercised.
+ */
+for (const [name, modelEfforts, expected] of [
+  ['no stored override keeps the former high default', undefined, 'high'],
+  ['an explicit override for the switched-to model applies verbatim', { 'cliproxyapi/second/gpt-6.1-sol': 'low' }, 'low'],
+  ['an override for another model never leaks onto the switched-to model', { 'cliproxyapi/main/gpt-6.1-sol': 'xhigh' }, 'high'],
+] as const) {
+  test(`effort startup: ${name}`, async () => {
+    const h = await quotaHost(modelEfforts ? { modelEfforts } : {}, { secondWhamUsedPercentPrimary: 10 });
+    try {
+      assert.equal(h.ctx.model.id, 'second/gpt-6.1-sol', 'startup must switch to the account with headroom');
+      assert.deepEqual(h.startupEfforts, [expected]);
+    } finally { await h.close(); }
+  });
+}

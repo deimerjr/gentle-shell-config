@@ -6,14 +6,16 @@ import { ErrorClassifier, type ClassificationAction } from './src/error-classifi
 import { FlowJournal, isMutatingTool } from './src/journal.ts';
 import { FlowLock } from './src/lock.ts';
 import { QuotaManager } from './src/quota-manager.ts';
-import { isSupervisorEnabled, loadSupervisorConfig, updateSupervisorConfig, getActiveCandidateIds, type SupervisorConfig } from './src/supervisor-config.ts';
+import { isSupervisorEnabled, loadSupervisorConfig, updateSupervisorConfig, selectSupervisorConfigScope, getActiveCandidateIds, type SupervisorConfig } from './src/supervisor-config.ts';
 import { assertWorkSettled, undeliverableTasks, verifiedCheckpoint } from './src/bridge.ts';
 import { type SupervisorPanelState } from './src/supervisor-panel.ts';
 import { createSupervisorDashboard } from './src/supervisor-dashboard.ts';
-import { loadSubagentConfig, updateSubagentConfig } from './src/subagent-config.ts';
+import { loadSubagentConfig, updateSubagentConfig, selectSubagentConfigScope } from './src/subagent-config.ts';
+import { resolveConfigurationLocation } from './src/configuration-scope.ts';
 import { registerSubagentAssignment } from './src/subagent-assignment.ts';
 import { isValidCandidateId } from './src/candidate-id.ts';
 import { applyLiveSupervisorConfig } from './src/supervisor-live-config.ts';
+import { supportedModelEfforts, type ModelEffort } from './src/model-effort.ts';
 import type { ModelCandidate, RegisteredModel, SupervisorSafetyFaultKind, SupervisorState } from './src/types.ts';
 
 interface ReadyRotation {
@@ -60,6 +62,12 @@ interface Runtime {
   pendingTurnTrigger?: boolean;
   modelRevision: number;
   applyingModel?: string;
+  /**
+   * Explicit per-model reasoning effort (S1, S2), keyed by full candidate ID. An absent
+   * entry for a given model preserves the former behaviour: the Orchestrator keeps
+   * applying `high` for that model exactly as before this feature existed.
+   */
+  modelEfforts: Record<string, ModelEffort>;
   ctx: any;
 }
 
@@ -215,7 +223,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
       const quotas = new QuotaManager({ codexQuotaThresholdPercent: config.codexQuotaThresholdPercent, priorityCandidateIds: getActiveCandidateIds(config) });
       const guard = new ContextGuard({ rotationThresholdPercent: config.rotationThresholdPercent });
       guard.setAutoRotate(config.autoRotate);
-      const r: Runtime = { sessionId: id, cwd: ctx.cwd, state, journal, lock, errors, quotas, guard, autoRotate: config.autoRotate, autoSwitchModel: config.autoSwitchModel, polling: false, inventoryReady: false, modelRevision: 0, disposed: false, dispatched: false, checkpointPrompted: false, pollMs: config.pollIntervalSeconds * 1000, ctx };
+      const r: Runtime = { sessionId: id, cwd: ctx.cwd, state, journal, lock, errors, quotas, guard, autoRotate: config.autoRotate, autoSwitchModel: config.autoSwitchModel, polling: false, inventoryReady: false, modelRevision: 0, disposed: false, dispatched: false, checkpointPrompted: false, pollMs: config.pollIntervalSeconds * 1000, modelEfforts: config.modelEfforts ?? {}, ctx };
       reconcileDeliveries(r, ctx);
       runtime = r; persist(r);
       sessionRuntimes.set(ctx.sessionManager, r);
@@ -257,6 +265,9 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
   const applyLiveConfig = (ctx: any, next: SupervisorConfig): void => {
     const live = boundRuntime(runtime, ctx);
     if (!live) return;
+    // Explicit per-model efforts take effect on the next successful model switch; adopting
+    // the map now never itself changes the currently applied thinking level.
+    live.modelEfforts = next.modelEfforts ?? {};
     applyLiveSupervisorConfig({
       quotas: live.quotas,
       guard: live.guard,
@@ -274,6 +285,29 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
   };
 
   /**
+   * Enriches panel candidates with the public-host-proven effort levels for the actual
+   * registry model behind each candidate ID (S2). A candidate whose model cannot be
+   * resolved, or whose capability the host cannot prove, keeps `supportedEfforts`
+   * unset/empty: the effort picker then offers Default only, never an invented level.
+   * Used by both tabs so the Orchestrator and Subagents pickers see the same capability.
+   */
+  async function enrichWithSupportedEfforts(ctx: any, candidates: ModelCandidate[]): Promise<ModelCandidate[]> {
+    return Promise.all(candidates.map(async candidate => {
+      let model: any;
+      try {
+        const modelSlug = candidate.id.slice(candidate.provider.length + 1);
+        model = ctx.modelRegistry?.find?.(candidate.provider, modelSlug);
+      } catch { model = undefined; }
+      if (!model) return candidate;
+      let supportedEfforts: ModelEffort[];
+      try { supportedEfforts = await supportedModelEfforts(model); }
+      catch { supportedEfforts = []; }
+      if (!supportedEfforts.length) return candidate;
+      return { ...candidate, supportedEfforts };
+    }));
+  }
+
+  /**
    * The catalogue the priority pickers offer. A live runtime answers from its own inventory
    * (one shared discovery). With the runtime off there is no manager to ask, so this builds
    * a throwaway one for the same discovery; a failed account lookup still leaves the host
@@ -284,7 +318,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
     if (live) {
       try { await refreshCandidates(live, ctx); } catch { /* Reported through inventoryError. */ }
       if (boundRuntime(runtime, ctx) === live) {
-        return { candidates: live.quotas.getCandidates(), discoveryFailed: Boolean(live.inventoryError) };
+        return { candidates: await enrichWithSupportedEfforts(ctx, live.quotas.getCandidates()), discoveryFailed: Boolean(live.inventoryError) };
       }
     }
     const loaded = loadSupervisorConfig(ctx.cwd);
@@ -297,7 +331,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
     try {
       await probe.discoverCandidates(id => Boolean(ctx.modelRegistry?.find?.('cliproxyapi', id.slice('cliproxyapi/'.length))));
     } catch { discoveryFailed = true; }
-    return { candidates: probe.getCandidates(), discoveryFailed };
+    return { candidates: await enrichWithSupportedEfforts(ctx, probe.getCandidates()), discoveryFailed };
   }
 
   /**
@@ -347,16 +381,14 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
 
   /**
    * Opens the configuration panel (S4, S6, S8). Deliberately independent from `bound()`: the
-   * panel is how a project is switched back on, so it must open with the runtime off. It refuses
-   * to open over an unusable config file instead of letting a UI surface rewrite one, and it
-   * closes without writing when its session was replaced.
+   * panel is how a project is switched back on, so it must open with the runtime off.
+   * Unusable sources stay read-only, while the other tab and explicit source selection
+   * remain accessible. A replaced session closes without writing.
    */
   async function openSupervisorPanel(ctx: any): Promise<void> {
+    // Reject untrusted/noninteractive contexts before reading repository preferences.
+    if (ctx.mode !== 'tui' || (ctx.isProjectTrusted && !ctx.isProjectTrusted())) return;
     const loaded = loadSupervisorConfig(ctx.cwd);
-    if (loaded.error) {
-      notify(ctx, `Supervisor panel unavailable: ${loaded.error}`, 'warning');
-      return;
-    }
     const lib = overrides.panelLib ?? await loadRoutingSelectorLib();
     if (!lib || typeof ctx.ui?.custom !== 'function') {
       notify(ctx, 'The configuration panel needs a host with custom components; this session cannot configure the supervisor.', 'warning');
@@ -376,7 +408,11 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
     // Subagent preferences use the complete Pi registry, independently from account
     // discovery's one-model-per-account inventory and the Orchestrator's active slots.
     const subagents = loadSubagentConfig(ctx.cwd);
-    const subagentCandidates: ModelCandidate[] = hostRegisteredModels(ctx)
+    const locationFor = (kind: 'supervisor' | 'subagents') => {
+      try { return resolveConfigurationLocation(ctx.cwd, kind); }
+      catch (error) { return { scope: 'unavailable' as const, path: String(error) }; }
+    };
+    const subagentCandidates: ModelCandidate[] = await enrichWithSupportedEfforts(ctx, hostRegisteredModels(ctx)
       .filter(model => isValidCandidateId(`${model.provider}/${model.id}`))
       .map(model => ({
         id: `${model.provider}/${model.id}`,
@@ -386,7 +422,8 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
         quotaProtocol: 'none',
         reasoningEffort: 'high',
         contextWindowCap: model.contextWindow,
-      }));
+      })));
+    if (!current()) return;
     try {
       await ctx.ui.custom((tui: any, theme: any, keybindings: any, done: () => void) => createSupervisorDashboard({ orchestrator: {
         lib,
@@ -394,11 +431,24 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
         theme,
         keybindings,
         config: loaded.config,
+        error: loaded.error,
+        scopeControl: {
+          location: locationFor('supervisor'),
+          select: scope => {
+            if (!current()) throw new Error('The supervisor panel session was replaced.');
+            // Selecting a source never acknowledges effects or clears a safety fault.
+            const selected = selectSupervisorConfigScope(ctx.cwd, scope);
+            if (!selected.config.enabled) teardownRuntime(ctx);
+            else { ensureRuntime(ctx); applyLiveConfig(ctx, selected.config); }
+            return selected;
+          },
+        },
         state: () => panelState(ctx),
         candidates: catalogue.candidates,
         discoveryFailed: catalogue.discoveryFailed,
         isBound: current,
         applyConfig: (patch: Partial<SupervisorConfig>) => {
+          if (!current()) throw new Error('The supervisor panel session was replaced.');
           const next = updateSupervisorConfig(ctx.cwd, patch);
           applyLiveConfig(ctx, next);
           return next;
@@ -426,6 +476,13 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
         done,
       }, subagents: {
         config: subagents.config,
+        scopeControl: {
+          location: locationFor('subagents'),
+          select: scope => {
+            if (!current()) throw new Error('The supervisor panel session was replaced.');
+            return selectSubagentConfigScope(ctx.cwd, scope);
+          },
+        },
         candidates: subagentCandidates,
         error: subagents.error,
         applyConfig: patch => {
@@ -522,7 +579,11 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
     finally { r.applyingModel = undefined; }
     if (!applied || runtime !== r || r.disposed || halted(r) || revision !== r.modelRevision) return false;
     r.state.activeModel = id as SupervisorState['activeModel'];
-    pi.setThinkingLevel('high');
+    // S1/S2: an explicit per-model effort applies only after setModel actually succeeded and
+    // every stale/generation guard above already passed. Absence preserves the former
+    // behaviour for this model (the Orchestrator default of `high`); the host still clamps.
+    try { pi.setThinkingLevel(r.modelEfforts[id] ?? 'high'); }
+    catch { /* A capability rejection must never block the already-applied model switch. */ }
     persist(r);
     status(r, id);
     notify(ctx, `Supervisor switched to routing model ${id}.`);
@@ -561,7 +622,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
   };
 
   pi.registerCommand('supervisor', {
-    description: 'Supervisor configuration: Orchestrator state, model slots and automation; Subagents enable, unique Pi model slots (2–20), saved JSON preferences and least-loaded model assignment in Gentle Agents RPC children.',
+    description: 'Supervisor configuration: independent Project/Global sources and effective paths for Orchestrator and Subagents; Orchestrator state, model slots and automation; Subagents enable, unique Pi model slots (2–20) and least-loaded model assignment in Gentle Agents RPC children.',
     handler: async (args, ctx) => {
       if (args.trim()) {
         // Exactly one human command exists. Anything else is a usage error, never a hidden alias.

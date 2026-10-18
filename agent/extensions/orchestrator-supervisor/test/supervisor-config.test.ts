@@ -337,3 +337,64 @@ test('SUPERVISOR-CONFIG-012: an out-of-range value refuses before writing anythi
     assert.deepEqual(readFileSync(s.path()), before);
   } finally { s.close(); }
 });
+
+test('SUPERVISOR-CONFIG-015 (S1, S2): modelEfforts is absent by default, and an old file without it stays absent', () => {
+  assert.equal(DEFAULT_SUPERVISOR_CONFIG.modelEfforts, undefined);
+  assert.equal(validateSupervisorConfig({ version: 1 }).modelEfforts, undefined);
+  // A file written before this field existed has no `modelEfforts` key at all.
+  assert.equal(validateSupervisorConfig({ version: 1, enabled: true, rotationThresholdPercent: 85 }).modelEfforts, undefined);
+});
+
+test('SUPERVISOR-CONFIG-016 (S1, S2): modelEfforts round-trips through save/load and update, keyed by full candidate ID', () => {
+  const s = scratch();
+  try {
+    const efforts = { 'cliproxyapi/main/gpt-6.1-sol': 'xhigh', 'anthropic/claude-sonnet-4-5': 'low' };
+    const saved = saveSupervisorConfig(s.cwd, { ...DEFAULT_SUPERVISOR_CONFIG, modelEfforts: efforts });
+    assert.deepEqual(saved.modelEfforts, efforts);
+    const loaded = loadSupervisorConfig(s.cwd);
+    assert.equal(loaded.source, 'file');
+    assert.deepEqual(loaded.config.modelEfforts, efforts);
+
+    // A patch to an unrelated field preserves the stored effort map untouched.
+    const afterPatch = updateSupervisorConfig(s.cwd, { cooldownMinutes: 20 });
+    assert.deepEqual(afterPatch.modelEfforts, efforts);
+
+    // A patch can replace the whole map explicitly (the panel always writes the complete map).
+    const narrowed = updateSupervisorConfig(s.cwd, { modelEfforts: { 'anthropic/claude-sonnet-4-5': 'medium' } });
+    assert.deepEqual(narrowed.modelEfforts, { 'anthropic/claude-sonnet-4-5': 'medium' });
+  } finally { s.close(); }
+});
+
+test('SUPERVISOR-CONFIG-017 (S1, S2): modelEfforts validation never truncates a hidden/unassigned entry', () => {
+  const s = scratch();
+  try {
+    // An entry for a model outside the active routing slots is still validated and kept:
+    // per-model preferences may be reused later even while hidden from the active pool.
+    const efforts = { 'cliproxyapi/main/gpt-6.1-sol': 'high', 'p/not-in-any-slot': 'minimal' };
+    const saved = updateSupervisorConfig(s.cwd, { priorityCandidateIds: ['cliproxyapi/main/gpt-6.1-sol'], modelCount: 2, modelEfforts: efforts });
+    assert.deepEqual(saved.modelEfforts, efforts);
+    assert.deepEqual(loadSupervisorConfig(s.cwd).config.modelEfforts, efforts);
+  } finally { s.close(); }
+});
+
+test('SUPERVISOR-CONFIG-018 (S1, S2): an unsupported effort value is refused before writing anything', () => {
+  const s = scratch();
+  try {
+    saveSupervisorConfig(s.cwd, { ...DEFAULT_SUPERVISOR_CONFIG, enabled: true });
+    const before = readFileSync(s.path());
+    assert.throws(
+      () => updateSupervisorConfig(s.cwd, { modelEfforts: { 'cliproxyapi/main/gpt-6.1-sol': 'extreme' } as any }),
+      /unsupported effort/,
+    );
+    assert.deepEqual(readFileSync(s.path()), before);
+    assert.throws(
+      () => validateSupervisorConfig({ version: 1, modelEfforts: { 'a/b': 'nope' } }),
+      /unsupported effort/,
+    );
+  } finally { s.close(); }
+});
+
+test('SUPERVISOR-CONFIG-019 (S1, S2): a malformed modelEfforts root is refused like every other malformed field', () => {
+  assert.throws(() => validateSupervisorConfig({ version: 1, modelEfforts: ['high'] }), /expected an object/);
+  assert.throws(() => validateSupervisorConfig({ version: 1, modelEfforts: 'high' }), /expected an object/);
+});
