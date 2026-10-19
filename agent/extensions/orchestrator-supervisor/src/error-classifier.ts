@@ -198,7 +198,8 @@ export class ErrorClassifier {
     const isNoCapacityOrNoAuth =
       lower.includes('auth_unavailable') ||
       lower.includes('no capacity available') ||
-      lower.includes('no auth available');
+      lower.includes('no auth available') ||
+      lower.includes('model_capacity_exhausted');
 
     const isRateLimit429 = /\b429\b|rate.?limit|too many requests/i.test(rawError);
     const isQuotaConfirmedExhausted =
