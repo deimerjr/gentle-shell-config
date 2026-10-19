@@ -1,4 +1,4 @@
-import { closeSync, constants, mkdirSync, openSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -12,6 +12,50 @@ import { randomUUID } from 'node:crypto';
 
 const LOCK_ATTEMPTS = 5;
 const LOCK_WAIT_MS = 10;
+
+function reclaimStaleLock(lockPath: string): boolean {
+  let observed;
+  let raw: string;
+  try {
+    observed = statSync(lockPath);
+    raw = readFileSync(lockPath, 'utf8');
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return true;
+    return false;
+  }
+
+  let ownerPid: number;
+  try {
+    const payload = JSON.parse(raw);
+    ownerPid = payload.pid;
+    if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return false;
+  } catch {
+    return false;
+  }
+
+  try {
+    process.kill(ownerPid, 0);
+    return false;
+  } catch (err: any) {
+    if (err.code !== 'ESRCH') return false;
+  }
+
+  try {
+    const rechecked = statSync(lockPath);
+    const unchanged =
+      rechecked.dev === observed.dev &&
+      rechecked.ino === observed.ino &&
+      rechecked.size === observed.size &&
+      rechecked.mtimeMs === observed.mtimeMs &&
+      readFileSync(lockPath, 'utf8') === raw;
+    if (!unchanged) return false;
+    unlinkSync(lockPath);
+    return true;
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return true;
+    return false;
+  }
+}
 
 const capitalize = (value: string): string => value.charAt(0).toUpperCase() + value.slice(1);
 
@@ -28,9 +72,11 @@ export function withExclusiveFileLock<T>(filePath: string, label: string, action
   for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
     try {
       lockFd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      writeFileSync(lockFd, JSON.stringify({ pid: process.pid }) + '\n');
       break;
     } catch (err: any) {
       if (err.code === 'EEXIST') {
+        if (reclaimStaleLock(lockPath)) continue;
         if (attempt === LOCK_ATTEMPTS - 1) {
           throw new Error(`${capitalize(label)} lock held by another process`);
         }

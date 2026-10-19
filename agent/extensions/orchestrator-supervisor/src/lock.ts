@@ -62,27 +62,35 @@ export class FlowLock {
 
   static isOwnerAlive(payload: LockPayload): boolean {
     const currentBootId = FlowLock.getBootId();
-    if (payload.bootId && payload.bootId !== 'unknown-boot-id' && payload.bootId !== currentBootId) {
-      // System rebooted since lock was created
+    const bootIdentityAvailable =
+      payload.bootId &&
+      payload.bootId !== 'unknown-boot-id' &&
+      currentBootId !== 'unknown-boot-id';
+    if (bootIdentityAvailable && payload.bootId !== currentBootId) {
+      // A conclusive boot mismatch means the owner cannot still exist.
       return false;
     }
 
     try {
-      // Check process existence via signal 0
+      // Signal 0 is the portable process-existence check. Permission or platform errors
+      // are inconclusive and therefore preserve the lock.
       process.kill(payload.pid, 0);
     } catch (err: any) {
       if (err.code === 'ESRCH') {
         return false;
       }
+      return true;
     }
 
-    // Check start time ticks from /proc/<pid>/stat
+    // Linux exposes PID start time through /proc. Other platforms do not, so missing
+    // identity evidence is inconclusive rather than proof that the owner is dead.
     const actualTicks = FlowLock.getStartTimeTicks(payload.pid);
-    if (actualTicks === -1) {
-      return false;
-    }
-    if (payload.startTimeTicks > 0 && actualTicks !== payload.startTimeTicks) {
-      // PID was recycled by OS for another process
+    if (
+      payload.startTimeTicks > 0 &&
+      actualTicks > 0 &&
+      actualTicks !== payload.startTimeTicks
+    ) {
+      // PID was recycled by OS for another process.
       return false;
     }
 

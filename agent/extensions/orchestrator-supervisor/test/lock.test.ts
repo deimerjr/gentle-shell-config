@@ -44,6 +44,65 @@ test('MINI-001 / MINI-006: FlowLock acquires lock with 0700 dir and 0600 file', 
   }
 });
 
+test('S1: FlowLock treats unavailable cross-platform identity evidence as alive', () => {
+  const originalBootId = FlowLock.getBootId;
+  const originalStartTimeTicks = FlowLock.getStartTimeTicks;
+  const originalKill = process.kill;
+
+  try {
+    FlowLock.getBootId = () => 'unknown-boot-id';
+    FlowLock.getStartTimeTicks = () => -1;
+    process.kill = (() => true) as typeof process.kill;
+
+    assert.equal(
+      FlowLock.isOwnerAlive({
+        pid: 4242,
+        startTimeTicks: 12345,
+        bootId: 'boot-from-another-platform',
+        cmdline: 'pi',
+        sessionId: 'session-owner',
+        flowIdentity: 'flow-portable',
+        createdAt: 1,
+      }),
+      true,
+    );
+  } finally {
+    FlowLock.getBootId = originalBootId;
+    FlowLock.getStartTimeTicks = originalStartTimeTicks;
+    process.kill = originalKill;
+  }
+});
+
+test('S1: FlowLock only rejects PID identity when start-time evidence is conclusive', () => {
+  const originalBootId = FlowLock.getBootId;
+  const originalStartTimeTicks = FlowLock.getStartTimeTicks;
+  const originalKill = process.kill;
+
+  try {
+    FlowLock.getBootId = () => 'same-boot';
+    process.kill = (() => true) as typeof process.kill;
+    const payload = {
+      pid: 4242,
+      startTimeTicks: 12345,
+      bootId: 'same-boot',
+      cmdline: 'pi',
+      sessionId: 'session-owner',
+      flowIdentity: 'flow-identity',
+      createdAt: 1,
+    };
+
+    FlowLock.getStartTimeTicks = () => -1;
+    assert.equal(FlowLock.isOwnerAlive(payload), true);
+
+    FlowLock.getStartTimeTicks = () => 54321;
+    assert.equal(FlowLock.isOwnerAlive(payload), false);
+  } finally {
+    FlowLock.getBootId = originalBootId;
+    FlowLock.getStartTimeTicks = originalStartTimeTicks;
+    process.kill = originalKill;
+  }
+});
+
 test('MINI-001: FlowLock reclaims stale lock when PID is dead or boot ID differs', () => {
   const tmpDir = mkdtempSync(join(tmpdir(), 'supervisor-lock-stale-'));
   try {
