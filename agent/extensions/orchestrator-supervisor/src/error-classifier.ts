@@ -188,12 +188,17 @@ export class ErrorClassifier {
       };
     }
 
-    // Check hard quota exhaustion (literal OR HTTP 429 where fresh quota check confirms exhaustion)
+    // Check hard quota exhaustion or complete capacity/auth unavailability
     const isLiteralHardQuota =
       lower.includes('insufficient_quota') ||
       lower.includes('quota exceeded') ||
       lower.includes('out of budget') ||
       lower.includes('quota_exhausted');
+
+    const isNoCapacityOrNoAuth =
+      lower.includes('auth_unavailable') ||
+      lower.includes('no capacity available') ||
+      lower.includes('no auth available');
 
     const isRateLimit429 = /\b429\b|rate.?limit|too many requests/i.test(rawError);
     const isQuotaConfirmedExhausted =
@@ -202,13 +207,15 @@ export class ErrorClassifier {
       options.freshQuotaStatus.isEligible === false &&
       !options.freshQuotaStatus.isUnknown;
 
-    if (isLiteralHardQuota || isQuotaConfirmedExhausted) {
+    if (isLiteralHardQuota || isQuotaConfirmedExhausted || isNoCapacityOrNoAuth) {
       this.setCooldown(candidateId, this.cooldownMs);
       return {
         type: 'immediate_failover',
         isHardQuota: true,
         shouldAbortRetry: true,
-        reason: 'Immediate hard quota exhaustion detected; canceling retry sleep for instant failover.',
+        reason: isNoCapacityOrNoAuth
+          ? 'Immediate failover: no capacity or auth available on upstream provider.'
+          : 'Immediate hard quota exhaustion detected; canceling retry sleep for instant failover.',
       };
     }
 

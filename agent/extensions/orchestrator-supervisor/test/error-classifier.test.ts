@@ -42,6 +42,27 @@ test('MINI-003: Hard quota exhaustion triggers immediate abort and candidate exc
   assert.equal(action.shouldAbortRetry, true);
 });
 
+test('MINI-003: Upstream auth_unavailable / no capacity triggers immediate failover without 3 retries', () => {
+  const classifier = new ErrorClassifier('session-orch-1');
+
+  const noCapacityMsg = {
+    role: 'assistant',
+    stopReason: 'error',
+    errorMessage:
+      '503: {"message":"auth_unavailable: no auth available (providers=antigravity, model=Gem/gemini-3.8-flash-high; last upstream error: ... \\"code\\": 503, \\"message\\": \\"No capacity available for model gemini-3.8-flash-high on the server\\")"}',
+  };
+
+  const action = classifier.handleMessageEnd(noCapacityMsg, 'cpamc/Gem/gemini-3.8-flash-high', {
+    mode: 'tui',
+    sessionId: 'session-orch-1',
+  });
+
+  assert.equal(action.type, 'immediate_failover');
+  assert.equal(action.isHardQuota, true);
+  assert.equal(action.shouldAbortRetry, true);
+  assert.match(action.reason ?? '', /no capacity or auth available/i);
+});
+
 test('MINI-003: Transient 5xx increments counter; 3rd transient triggers candidate cooldown and failover', () => {
   const classifier = new ErrorClassifier('session-orch-1');
   const candidate = 'cliproxyapi/main/gpt-6.1-sol';
