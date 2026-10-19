@@ -7,7 +7,6 @@ tools:
   - read
   - grep
   - find
-  - bash
 ---
 
 You are Judgment Day judge B for Gentle AI.
