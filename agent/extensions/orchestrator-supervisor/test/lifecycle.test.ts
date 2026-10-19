@@ -616,7 +616,8 @@ test('S3: without proof of cancellation the obligation survives: live, finished,
 
 test('S2: a stopped job still blocks rotation, because job_list cannot prove its notice was dropped', async () => {
   const h = host('tui', {}, { panelLib: fakeLib, toolResults: { job_list: { result: {
-    content: [{ type: 'text', text: 'job-1 · stopped · label · 5s · /tmp/job-1.log' }] } } } });
+    content: [{ type: 'text', text: 'job-1 · stopped · label · 5s · /tmp/job-1.log' }],
+    details: { gentleJobs: { count: 1, jobs: [{ id: 'job-1', status: 'stopped' }] } } } } } });
   try {
     await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx);
     await h.hooks.get('tool_result')({ toolCallId: 'job', toolName: 'bash_background', isError: false,

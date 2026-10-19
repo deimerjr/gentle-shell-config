@@ -28,47 +28,52 @@ export async function assertWorkSettled(ctx: any): Promise<void> {
   ]) {
     const result = await existingTool(ctx, name!, {});
     const text = toolText(result).trim();
-    if (text === empty) continue;
-    if (!text) throw new Error(`Cannot verify ${kind}: empty response`);
-    let entriesCount = 0;
-    for (const rawLine of text.split('\n')) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      const fields = line.split(' · ');
-      if (kind === 'tasks') {
-        const isHeader = fields.length >= 4 && Boolean(fields[0]) && Boolean(fields[1]) && ['task', 'background'].includes(fields[3]!);
-        if (isHeader) {
-          const status = fields[2]!;
-          if (['queued', 'running', 'waiting', 'stopping'].includes(status)) {
-            throw new Error(`Rotation deferred: active ${kind} (${fields[0]})`);
-          }
-          if (!['completed', 'failed', 'cancelled', 'timed_out'].includes(status)) {
-            throw new Error(`Cannot verify ${kind}: unknown status ${status}`);
-          }
-          entriesCount++;
-          continue;
-        }
-        if (entriesCount > 0) continue;
-        throw new Error(`Cannot verify ${kind}: unsupported response`);
-      } else {
-        const rawStatus = fields[1];
-        const status = rawStatus?.replace(/^monitor /, '');
-        const isJobLine = fields.length >= 3 && Boolean(fields[0]) && Boolean(status);
-        if (isJobLine) {
-          if (['queued', 'running', 'waiting', 'stopping'].includes(status!)) {
-            throw new Error(`Rotation deferred: active ${kind} (${fields[0]})`);
-          }
-          if (!/^(exited( -?\d+|\s+\?)?|stopped|failed)$/.test(status!)) {
-            throw new Error(`Cannot verify ${kind}: unknown status ${status}`);
-          }
-          entriesCount++;
-          continue;
-        }
-        if (entriesCount > 0) continue;
+
+    if (kind === 'tasks') {
+      const tasks = result?.details?.gentleAgents?.tasks ?? result?.details?.tasks;
+      if (tasks === undefined) {
+        if (text === empty) continue;
         throw new Error(`Cannot verify ${kind}: unsupported response`);
       }
+      if (!Array.isArray(tasks)) {
+        throw new Error(`Cannot verify ${kind}: unsupported response`);
+      }
+      for (const item of tasks) {
+        if (!item || typeof item !== 'object') {
+          throw new Error(`Cannot verify ${kind}: unsupported response`);
+        }
+        const status = typeof item.status === 'string' ? item.status : '';
+        const id = item.id ?? item.taskId ?? 'unknown';
+        if (['queued', 'running', 'waiting', 'stopping'].includes(status)) {
+          throw new Error(`Rotation deferred: active ${kind} (${id})`);
+        }
+        if (!['completed', 'failed', 'cancelled', 'timed_out'].includes(status)) {
+          throw new Error(`Cannot verify ${kind}: unknown status ${status}`);
+        }
+      }
+    } else {
+      const jobs = result?.details?.gentleJobs?.jobs ?? result?.details?.jobs;
+      if (jobs === undefined) {
+        if (text === empty || result?.details?.gentleJobs?.count === 0) continue;
+        throw new Error(`Cannot verify ${kind}: unsupported response`);
+      }
+      if (!Array.isArray(jobs)) {
+        throw new Error(`Cannot verify ${kind}: unsupported response`);
+      }
+      for (const item of jobs) {
+        if (!item || typeof item !== 'object') {
+          throw new Error(`Cannot verify ${kind}: unsupported response`);
+        }
+        const status = typeof item.status === 'string' ? item.status.replace(/^monitor /, '') : '';
+        const id = item.id ?? item.jobId ?? 'unknown';
+        if (['queued', 'running', 'waiting', 'stopping'].includes(status)) {
+          throw new Error(`Rotation deferred: active ${kind} (${id})`);
+        }
+        if (!/^(exited( -?\d+|\s+\?)?|stopped|failed)$/.test(status)) {
+          throw new Error(`Cannot verify ${kind}: unknown status ${status}`);
+        }
+      }
     }
-    if (entriesCount === 0) throw new Error(`Cannot verify ${kind}: unsupported response`);
   }
 }
 
