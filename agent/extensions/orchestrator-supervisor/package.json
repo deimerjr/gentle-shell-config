@@ -4,6 +4,6 @@
   "private": true,
   "description": "Standalone supervisor using existing Gentle Shell tools and Pi lifecycle APIs",
   "type": "module",
-  "engines": { "node": ">=24.19.0" },
+  "engines": { "node": ">=22.0.0" },
   "scripts": { "test": "node --test test/*.test.ts" }
 }

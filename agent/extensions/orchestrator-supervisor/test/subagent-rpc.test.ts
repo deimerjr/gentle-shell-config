@@ -36,7 +36,7 @@ test('actual RPC children balance selected models before any provider request; o
     };
     const child = spawn(process.env.SUPERVISOR_TEST_PI_CLI || 'pi', [
       '--mode', 'rpc', '--offline', '--no-session', '--no-extensions',
-      '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files', '--no-mcp', '--no-tools',
+      '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files', '--no-tools',
       '--extension', providerPath, '--extension', extensionPath,
       '--model', `${provider}/baseline`,
     ], { cwd: project, env, stdio: ['pipe', 'pipe', 'pipe'] });
