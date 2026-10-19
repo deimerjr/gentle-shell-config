@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { updateSubagentConfig, resolveSubagentConfigPath } from '../src/subagent-config.ts';
+import { platform } from '../src/platform/index.ts';
 
 const extensionPath = fileURLToPath(new URL('../index.ts', import.meta.url));
 const providerPath = fileURLToPath(new URL('./fixtures/assignment-provider.ts', import.meta.url));
@@ -34,7 +35,7 @@ test('actual RPC children balance selected models before any provider request; o
       NODE_COMPILE_CACHE: join(root, 'compile-cache'),
       ...(marked ? { GENTLE_PI_AGENTS_CHILD: '1' } : {}),
     };
-    const child = spawn(process.env.SUPERVISOR_TEST_PI_CLI || 'pi', [
+    const child = spawn(process.env.SUPERVISOR_TEST_PI_CLI || platform.defaultPiCli(), [
       '--mode', 'rpc', '--offline', '--no-session', '--no-extensions',
       '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files', '--no-tools',
       '--extension', providerPath, '--extension', extensionPath,

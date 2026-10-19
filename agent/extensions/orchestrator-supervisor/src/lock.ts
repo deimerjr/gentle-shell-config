@@ -11,6 +11,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import type { LockPayload } from './types.ts';
+import { platform } from './platform/index.ts';
 
 export class FlowLock {
   readonly flowDir: string;
@@ -30,7 +31,8 @@ export class FlowLock {
 
   ensureDirectory(): void {
     if (!existsSync(this.flowDir)) {
-      mkdirSync(this.flowDir, { recursive: true, mode: 0o700 });
+      const mode = platform.directoryMode();
+      mkdirSync(this.flowDir, { recursive: true, ...(mode !== undefined ? { mode } : {}) });
     }
   }
 
@@ -39,25 +41,11 @@ export class FlowLock {
   }
 
   static getBootId(): string {
-    try {
-      return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    } catch {
-      return 'unknown-boot-id';
-    }
+    return platform.getBootId();
   }
 
   static getStartTimeTicks(pid: number): number {
-    try {
-      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-      const parenIdx = stat.lastIndexOf(')');
-      if (parenIdx < 0) return -1;
-      const tokens = stat.slice(parenIdx + 2).split(/\s+/);
-      // Field 22 is index 19 (since field 3 is index 0)
-      const field22 = tokens[19];
-      return field22 ? Number.parseInt(field22, 10) : -1;
-    } catch {
-      return -1;
-    }
+    return platform.getProcessStartTime(pid);
   }
 
   static isOwnerAlive(payload: LockPayload): boolean {
@@ -71,15 +59,8 @@ export class FlowLock {
       return false;
     }
 
-    try {
-      // Signal 0 is the portable process-existence check. Permission or platform errors
-      // are inconclusive and therefore preserve the lock.
-      process.kill(payload.pid, 0);
-    } catch (err: any) {
-      if (err.code === 'ESRCH') {
-        return false;
-      }
-      return true;
+    if (!platform.isProcessAlive(payload.pid)) {
+      return false;
     }
 
     // Linux exposes PID start time through /proc. Other platforms do not, so missing
@@ -115,10 +96,11 @@ export class FlowLock {
     };
 
     try {
+      const mode = platform.fileMode();
       const fd = openSync(
         this.lockPath,
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-        0o600,
+        mode !== undefined ? mode : 0o600,
       );
       try {
         const data = Buffer.from(JSON.stringify(payload, null, 2) + '\n', 'utf8');

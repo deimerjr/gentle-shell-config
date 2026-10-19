@@ -37,9 +37,9 @@ It is designed to be consumed as an overlay for personal or project-level Pi wor
 - **`SUPERVISOR_TEST_PI_CLI`** *(optional)*: Path to the Pi binary for integration tests (defaults to `pi` in `PATH`).
 
 ### 4. Supported Platforms
-- **Linux (Tier 1 - Fully Supported):** Full feature set, atomic file locks with reboot detection via `/proc/sys/kernel/random/boot_id` and PID reuse protection via `/proc/<pid>/stat`.
-- **macOS / POSIX (Tier 2 - Supported with Limitations):** Locks operate with conservative fail-closed semantics; PID reuse detection is disabled due to the lack of `/proc`.
-- **Windows (Tier 3 - Unsupported):** Not supported due to POSIX file permission, lock handle, and signal semantics differences. See `agent/extensions/orchestrator-supervisor/README.md` for full contract details.
+- **Linux (POSIX - Fully Supported):** Full native feature set, atomic file locks with reboot detection via `/proc/sys/kernel/random/boot_id` and PID reuse protection via `/proc/<pid>/stat`.
+- **Windows (Win32 - Supported via Platform Adapter):** Uses dedicated `win32Platform` adapter with uptime-derived boot identity, NTFS atomic rename retry loop, and `pi.cmd` CLI resolution.
+- **macOS / POSIX (Supported with Limitations):** Locks operate with conservative fail-closed semantics; PID reuse detection is disabled due to the lack of `/proc`. See `agent/extensions/orchestrator-supervisor/README.md` for full contract details.
 
 ---
 

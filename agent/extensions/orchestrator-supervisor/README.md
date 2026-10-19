@@ -125,23 +125,27 @@ The extension does not read `.env` or credential files. Session state, mutation 
 
 ## Supported platforms and operating system contract
 
-The supervisor extension relies on file-system locks, atomic renames, and cross-process liveness checks to ensure safety and prevent race conditions. The platform support tiers are:
+The supervisor extension relies on file-system locks, atomic renames, and cross-process liveness checks to ensure safety and prevent race conditions. Platform operations are isolated behind a platform adapter (`src/platform/`):
 
-- **Tier 1 — Linux (fully supported and tested):**
+- **Linux (POSIX — fully supported and natively tested):**
   - Full feature set is verified on Linux (x86_64, arm64).
   - Uses Linux `/proc/<pid>/stat` to inspect process start time ticks, preventing lock reclamation when PIDs are recycled by the kernel.
   - Uses `/proc/sys/kernel/random/boot_id` to reliably detect system reboots across sessions.
   - Stale locks are safely reclaimed only on verified `ESRCH` and matching metadata.
+  - Applies private permissions (`0o700` directories, `0o600` files).
 
-- **Tier 2 — macOS and other POSIX systems (supported with limitations):**
+- **Windows (Win32 — supported via platform adapter):**
+  - Uses `win32Platform` adapter with native Win32 path and process handling.
+  - Replaces `/proc/.../boot_id` with deterministic boot-time calculation derived from `os.uptime()`.
+  - Implements retry loops on atomic renames (`atomicRename`) to tolerate NTFS mandatory handle locks and temporary `EBUSY`/`EPERM` conditions.
+  - Resolves CLI executable to `pi.cmd` for child RPC process spawns.
+  - Process existence uses Win32 `process.kill(pid, 0)` with strict `ESRCH` fail-closed semantics (missing PID start time is conservative and never invalidates a lock prematurely).
+  - Omits POSIX octal file modes, relying on Windows user-profile ACL containment.
+
+- **macOS and other POSIX systems (supported with limitations):**
   - Basic mutual exclusion (`openSync` with `O_CREAT | O_EXCL`) and process existence checks (`process.kill(pid, 0)`) function as expected.
   - Because `/proc` is absent, boot ID detection and PID start-time verification are unavailable.
   - **Limitation:** In the absence of `/proc` evidence, the locking system fails closed: it treats any non-`ESRCH` process status as alive and will not reclaim locks against potentially recycled PIDs. Stale locks in the face of abnormal termination without PID death must be manually cleared.
-
-- **Tier 3 — Windows (unsupported):**
-  - Windows is not supported. POSIX process signal semantics (`kill(pid, 0)`), POSIX file permissions (`0o700`, `0o600`), and file locking semantics with open handles differ from POSIX expectations.
-
-Do not claim cross-platform portability beyond the tested Linux and POSIX behavior described above.
 
 ## Verification
 
