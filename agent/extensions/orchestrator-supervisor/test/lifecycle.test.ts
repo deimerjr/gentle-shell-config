@@ -930,6 +930,24 @@ test('S9: with automatic rotation on, the boundary still requests the checkpoint
   } finally { await h.close(); }
 });
 
+test('normal assistant-final idle settlement (canContinue=false) requests checkpoint at threshold and suppresses duplicates', async () => {
+  const h = host();
+  try {
+    await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx);
+    h.ctx.getContextUsage = () => ({ tokens: 9900, contextWindow: 10000, percent: 99 });
+    const boundary = { outcome: 'success', entries: [], continue: false, context: { canContinue: false } };
+    const result = await h.hooks.get('agent_before_settle')(boundary, h.ctx);
+    assert.equal(result?.continue, true);
+    assert.equal(result?.entries?.length, 1);
+    assert.equal(result?.entries?.[0]?.type, 'custom_message');
+    assert.equal(result?.entries?.[0]?.customType, 'supervisor-checkpoint-request');
+
+    // Duplicate suppression: subsequent settlement in the same turn must not prompt again
+    const second = await h.hooks.get('agent_before_settle')(boundary, h.ctx);
+    assert.equal(second, undefined, 'duplicate checkpoint injection must be suppressed');
+  } finally { await h.close(); }
+});
+
 test('S9: automatic rotation off suppresses only the threshold request', async () => {
   const h = host('tui', {}, { panelLib: fakeLib });
   try {

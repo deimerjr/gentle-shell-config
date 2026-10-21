@@ -832,7 +832,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
   });
   pi.on('agent_before_settle', async (event, ctx) => {
     const r = bound(ctx); if (!r || halted(r) || event.outcome === 'aborted' || r.ready) return;
-    if (r.autoRotate && exceeded(r, ctx) && !r.checkpointPrompted && event.context.canContinue) {
+    if (r.autoRotate && exceeded(r, ctx) && !r.checkpointPrompted) {
       r.checkpointPrompted = true;
       return { entries: [{ type: 'custom_message', customType: 'supervisor-checkpoint-request', content: checkpointRequest, display: true, details: {} }], continue: true };
     }
