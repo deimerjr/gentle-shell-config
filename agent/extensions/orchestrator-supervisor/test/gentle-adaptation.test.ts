@@ -11,7 +11,7 @@ test('standalone loading requires no changes to project settings', () => {
   const dir = mkdtempSync(join(tmpdir(), 'supervisor-config-'));
   try {
     assert.equal(isExtensionEnabled('orchestrator-supervisor', dir), true);
-    assert.match(resolveSupervisorDir('flow'), /orchestrator-supervisor\/\.runtime\/flow$/);
+    assert.equal(resolveSupervisorDir('flow').endsWith(join('orchestrator-supervisor', '.runtime', 'flow')), true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

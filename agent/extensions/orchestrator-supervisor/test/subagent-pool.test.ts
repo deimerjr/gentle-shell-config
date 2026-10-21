@@ -64,18 +64,33 @@ function waitFor(predicate: () => boolean, timeoutMs: number, describe: () => st
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const timer = setInterval(() => {
-      if (predicate()) {
+      try {
+        if (predicate()) {
+          clearInterval(timer);
+          resolve();
+          return;
+        }
+        if (Date.now() - started > timeoutMs) {
+          clearInterval(timer);
+          reject(new Error(`timed out waiting: ${describe()}`));
+        }
+      } catch (error) {
         clearInterval(timer);
-        resolve();
-        return;
-      }
-      if (Date.now() - started > timeoutMs) {
-        clearInterval(timer);
-        reject(new Error(`timed out waiting: ${describe()}`));
+        reject(error);
       }
     }, 10);
   });
 }
+
+test('pool readiness polling reports child failures immediately', async () => {
+  let calls = 0;
+  await assert.rejects(waitFor(() => {
+    calls++;
+    throw new Error('child spawn failed: ENOENT');
+  }, 100, () => 'child'), /child spawn failed: ENOENT/);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(calls, 1, 'rejection clears the polling interval');
+});
 
 test('SUBAGENT-POOL-001 (S3): a first acquisition creates a versioned private pool file with least-loaded selection starting at the first candidate', () => {
   const s = scratch();
@@ -98,8 +113,15 @@ test('SUBAGENT-POOL-001 (S3): a first acquisition creates a versioned private po
     assert.equal(state.leases[0].sessionId, 's1');
     assert.equal(typeof state.leases[0].acquiredAt, 'number');
     assert.deepEqual(state.rotation, { 'p/a': 1 });
-    assert.equal(statSync(s.path()).mode & 0o777, 0o600, 'the pool file is private');
-    assert.equal(statSync(dirname(s.path())).mode & 0o777, 0o700, 'the pool directory is private');
+    const fileStat = statSync(s.path());
+    const dirStat = statSync(dirname(s.path()));
+    assert.equal(fileStat.isFile(), true);
+    assert.equal(dirStat.isDirectory(), true);
+    // POSIX mode bits do not verify Windows ACL privacy.
+    if (process.platform !== 'win32') {
+      assert.equal(fileStat.mode & 0o777, 0o600, 'the pool file is private');
+      assert.equal(dirStat.mode & 0o777, 0o700, 'the pool directory is private');
+    }
   } finally { s.close(); }
 });
 
@@ -253,16 +275,34 @@ test('SUBAGENT-POOL-008 (S3): only an ESRCH-proven dead process frees its lease;
     try { process.kill(deadPid, 0); } catch (err: any) { provenEsrch = err.code === 'ESRCH'; }
     assert.equal(provenEsrch, true, 'the reaped child is really gone');
 
+    // This PID is intercepted below, never assumed to exist or be inaccessible.
+    const deniedPid = Math.max(deadPid, process.pid) + 1;
     s.seed(JSON.stringify({
       version: 1,
       leases: [
         { token: 'dead', modelId: 'p/a', pid: deadPid, sessionId: 'dead', acquiredAt: 1 },
-        { token: 'eperm', modelId: 'p/a', pid: 1, sessionId: 'root', acquiredAt: 1 },
+        { token: 'eperm', modelId: 'p/a', pid: deniedPid, sessionId: 'denied', acquiredAt: 1 },
         { token: 'live', modelId: 'p/a', pid: process.pid, sessionId: 'self', acquiredAt: 1 },
       ],
       rotation: {},
     }));
-    acquireSubagentModel(s.cwd, ['p/a'], owner('newcomer'));
+    const originalKill = process.kill;
+    let deniedProbes = 0;
+    try {
+      process.kill = (pid, signal) => {
+        if (pid === deniedPid && signal === 0) {
+          deniedProbes++;
+          const error: any = new Error('permission denied probing process');
+          error.code = 'EPERM';
+          throw error;
+        }
+        return originalKill(pid, signal);
+      };
+      acquireSubagentModel(s.cwd, ['p/a'], owner('newcomer'));
+    } finally {
+      process.kill = originalKill;
+    }
+    assert.equal(deniedProbes > 0, true, 'the EPERM probe was exercised');
     const tokens = s.read().leases.map((lease: any) => lease.token);
     assert.equal(tokens.includes('dead'), false, 'the ESRCH lease is pruned');
     assert.equal(tokens.includes('eperm'), true, 'an EPERM (foreign but present) process stays occupied');
@@ -423,8 +463,128 @@ process.stdin.on('data', (chunk) => {
 process.stdin.resume();
 `;
 
+interface PoolChildRecord {
+  child: ReturnType<typeof spawn>;
+  out: string;
+  err: string;
+  failure: Error | null;
+  ready: { leases: Array<{ sessionId: string; token: string; modelId: string }> } | null;
+  released: boolean;
+  closed: boolean;
+  done: Promise<void>;
+}
+
+function trackPoolChild(child: ReturnType<typeof spawn>): PoolChildRecord {
+  const record: PoolChildRecord = {
+    child, out: '', err: '', failure: null, ready: null,
+    released: false, closed: false, done: Promise.resolve(),
+  };
+  record.done = new Promise(resolve => child.once('close', () => {
+    record.closed = true;
+    resolve();
+  }));
+  child.on('error', error => { record.failure = error; });
+  child.stdin?.on('error', error => { record.failure = error; });
+  child.stdout?.setEncoding('utf8');
+  child.stderr?.setEncoding('utf8');
+  child.stdout?.on('data', (chunk: string) => {
+    record.out += chunk;
+    for (const line of record.out.split('\n')) {
+      try {
+        const message = JSON.parse(line);
+        if (message.type === 'ready') record.ready = message;
+        if (message.type === 'released') record.released = true;
+      } catch { /* wait for the complete line */ }
+    }
+  });
+  child.stderr?.on('data', (chunk: string) => { record.err += chunk; });
+  return record;
+}
+
+function describePoolChildren(children: PoolChildRecord[]): string {
+  return children.map((record, index) =>
+    `child=${index} pid=${record.child.pid} code=${record.child.exitCode} signal=${record.child.signalCode}` +
+    ` error=${record.failure?.message ?? 'none'} stdout=${record.out.trim()} stderr=${record.err.trim()}`,
+  ).join(' | ');
+}
+
+function poolChildrenReached(children: PoolChildRecord[], phase: 'ready' | 'released'): boolean {
+  for (const record of children) {
+    if (record.failure) {
+      throw new Error(`pool child failed while waiting for ${phase}: ${describePoolChildren(children)}`);
+    }
+    const exited = record.closed || record.child.exitCode !== null || record.child.signalCode !== null;
+    // A release acknowledgement can arrive before exit; wait for close so output is drained.
+    if (exited && (phase === 'ready' || record.child.exitCode !== 0 || (record.closed && !record.released))) {
+      throw new Error(`pool child exited before ${phase}: ${describePoolChildren(children)}`);
+    }
+  }
+  return children.every(record => phase === 'ready' ? record.ready !== null : record.closed && record.released);
+}
+
+async function stopPoolChildren(children: PoolChildRecord[]): Promise<void> {
+  for (const record of children) {
+    if (!record.closed && record.child.exitCode === null && record.child.signalCode === null && record.child.pid !== undefined) {
+      record.child.kill('SIGKILL');
+    }
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.all(children.map(record => record.done)),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`pool child cleanup timed out: ${describePoolChildren(children)}`)), 2000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test('pool child diagnostics report spawn errors and premature exits', async () => {
+  const s = scratch();
+  const children: PoolChildRecord[] = [];
+  try {
+    const missing = trackPoolChild(spawn(join(s.dir, 'missing-executable'), [], { stdio: 'pipe' }));
+    children.push(missing);
+    await assert.rejects(waitFor(() => poolChildrenReached([missing], 'ready'), 2000,
+      () => describePoolChildren([missing])), /pool child failed.*ENOENT/);
+
+    const early = trackPoolChild(spawn(process.execPath, ['-e', "process.stderr.write('early exit'); process.exitCode = 7"], { stdio: 'pipe' }));
+    children.push(early);
+    await early.done;
+    await assert.rejects(waitFor(() => poolChildrenReached([early], 'ready'), 2000,
+      () => describePoolChildren([early])), /exited before ready:.*code=7.*stderr=early exit/);
+
+    const noRelease = trackPoolChild(spawn(process.execPath, ['-e', ''], { stdio: 'pipe' }));
+    children.push(noRelease);
+    await noRelease.done;
+    await assert.rejects(waitFor(() => poolChildrenReached([noRelease], 'released'), 2000,
+      () => describePoolChildren([noRelease])), /exited before released:.*code=0/);
+  } finally {
+    await stopPoolChildren(children);
+    s.close();
+  }
+});
+
+test('pool child cleanup awaits termination before scratch deletion', async () => {
+  const s = scratch();
+  const children: PoolChildRecord[] = [];
+  try {
+    const held = trackPoolChild(spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'pipe' }));
+    children.push(held);
+    await stopPoolChildren(children);
+    assert.equal(held.closed, true, 'cleanup waits for close, not just the kill request');
+    assert.equal(existsSync(s.dir), true, 'scratch still exists after child termination');
+  } finally {
+    await stopPoolChildren(children);
+    s.close();
+  }
+});
+
 test('SUBAGENT-POOL-011 (S3): separate processes coordinate concurrent acquisitions and releases through the shared file', { timeout: 25000 }, async () => {
   const s = scratch();
+  const children: PoolChildRecord[] = [];
   try {
     const childScript = join(s.dir, 'pool-child.mjs');
     writeFileSync(childScript, POOL_CHILD_SOURCE);
@@ -433,8 +593,6 @@ test('SUBAGENT-POOL-011 (S3): separate processes coordinate concurrent acquisiti
     const childCount = 6;
     const perChild = 4;
 
-    interface ChildRecord { child: ReturnType<typeof spawn>; out: string; err: string; ready: { leases: Array<{ sessionId: string; token: string; modelId: string }> } | null; }
-    const children: ChildRecord[] = [];
     for (let index = 0; index < childCount; index++) {
       const sessions = Array.from({ length: perChild }, (_, slot) => `session-${index}-${slot}`);
       const child = spawn(process.execPath, [childScript], {
@@ -447,24 +605,13 @@ test('SUBAGENT-POOL-011 (S3): separate processes coordinate concurrent acquisiti
         },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
-      const record: ChildRecord = { child, out: '', err: '', ready: null };
-      child.stdout?.setEncoding('utf8');
-      child.stderr?.setEncoding('utf8');
-      child.stdout?.on('data', (chunk: string) => {
-        record.out += chunk;
-        for (const line of record.out.split('\n')) {
-          if (!line.includes('"type":"ready"')) continue;
-          try { record.ready = JSON.parse(line); } catch { /* wait for the complete line */ }
-        }
-      });
-      child.stderr?.on('data', (chunk: string) => { record.err += chunk; });
-      children.push(record);
+      children.push(trackPoolChild(child));
     }
 
     await waitFor(
-      () => children.every(record => record.ready !== null),
+      () => poolChildrenReached(children, 'ready'),
       20000,
-      () => children.map(record => `code=${record.child.exitCode} err=${record.err.trim()}`).join(' | '),
+      () => describePoolChildren(children),
     );
 
     const allLeases = children.flatMap(record => record.ready!.leases);
@@ -477,9 +624,9 @@ test('SUBAGENT-POOL-011 (S3): separate processes coordinate concurrent acquisiti
 
     for (const record of children) record.child.stdin?.write('release\n');
     await waitFor(
-      () => children.every(record => record.child.exitCode !== null || record.child.signalCode !== null),
+      () => poolChildrenReached(children, 'released'),
       20000,
-      () => children.map(record => `code=${record.child.exitCode} err=${record.err.trim()}`).join(' | '),
+      () => describePoolChildren(children),
     );
     for (const record of children) {
       assert.equal(record.child.exitCode, 0, `child exited cleanly (stderr: ${record.err})`);
@@ -488,5 +635,8 @@ test('SUBAGENT-POOL-011 (S3): separate processes coordinate concurrent acquisiti
     const drained = s.read();
     assert.deepEqual(drained.leases, [], 'every cross-process release reached the shared file');
     assert.deepEqual(drained.rotation, { 'p/a': 8, 'p/b': 8, 'p/c': 8 });
-  } finally { s.close(); }
+  } finally {
+    await stopPoolChildren(children);
+    s.close();
+  }
 });

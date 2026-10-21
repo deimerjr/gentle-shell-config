@@ -96,8 +96,15 @@ test('SUBAGENT-CONFIG-002 (S4): a written configuration round-trips through a fr
       modelCount: 3,
       priorityCandidateIds: ['cliproxyapi/main/gpt-6.1-sol', 'anthropic/claude-sonnet-4-5', 'openrouter/meta-llama/llama-3-70b'],
     });
-    assert.equal(statSync(s.path()).mode & 0o777, 0o600, 'file is private');
-    assert.equal(statSync(dirname(s.path())).mode & 0o777, 0o700, 'directory is private');
+    const fileStat = statSync(s.path());
+    const dirStat = statSync(dirname(s.path()));
+    assert.equal(fileStat.isFile(), true);
+    assert.equal(dirStat.isDirectory(), true);
+    // POSIX mode bits do not verify Windows ACL privacy.
+    if (process.platform !== 'win32') {
+      assert.equal(fileStat.mode & 0o777, 0o600, 'file is private');
+      assert.equal(dirStat.mode & 0o777, 0o700, 'directory is private');
+    }
     // The atomic writer leaves no temporary sibling behind.
     assert.deepEqual(readdirSync(dirname(s.path())), ['subagents.json']);
 

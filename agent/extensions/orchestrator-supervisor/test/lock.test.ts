@@ -16,14 +16,15 @@ test('MINI-001 / MINI-006: FlowLock acquires lock with 0700 dir and 0600 file', 
     assert.equal(lock.isHeld(), true);
 
     const dirStat = statSync(flowDir);
-    // Dir mode permissions (0o700)
-    assert.equal(dirStat.mode & 0o777, 0o700);
+    assert.equal(dirStat.isDirectory(), true);
+    // POSIX mode bits do not verify Windows ACL privacy.
+    if (process.platform !== 'win32') assert.equal(dirStat.mode & 0o777, 0o700);
 
     const lockFile = join(flowDir, 'supervisor.lock');
     assert.equal(existsSync(lockFile), true);
     const fileStat = statSync(lockFile);
-    // File mode permissions (0o600)
-    assert.equal(fileStat.mode & 0o777, 0o600);
+    assert.equal(fileStat.isFile(), true);
+    if (process.platform !== 'win32') assert.equal(fileStat.mode & 0o777, 0o600);
 
     // Concurrent lock attempt with different session rejects
     const lock2 = new FlowLock(flowDir, 'flow-1234', 'session-2');

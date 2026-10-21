@@ -63,8 +63,15 @@ test('SUPERVISOR-CONFIG-002: saving round-trips through a fresh read, private an
       priorityCandidateIds: ['cliproxyapi/main/gpt-6.1-sol', 'anthropic/claude-sonnet-4-5'],
     });
     assert.equal(saved.enabled, false);
-    assert.equal(statSync(s.path()).mode & 0o777, 0o600);
-    assert.equal(statSync(dirname(s.path())).mode & 0o777, 0o700);
+    const fileStat = statSync(s.path());
+    const dirStat = statSync(dirname(s.path()));
+    assert.equal(fileStat.isFile(), true);
+    assert.equal(dirStat.isDirectory(), true);
+    // POSIX mode bits do not verify Windows ACL privacy.
+    if (process.platform !== 'win32') {
+      assert.equal(fileStat.mode & 0o777, 0o600);
+      assert.equal(dirStat.mode & 0o777, 0o700);
+    }
 
     const loaded = loadSupervisorConfig(s.cwd);
     assert.equal(loaded.source, 'file');
