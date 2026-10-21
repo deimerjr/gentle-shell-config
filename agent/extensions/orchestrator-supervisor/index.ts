@@ -33,6 +33,8 @@ async function loadRoutingSelectorLib(): Promise<any | undefined> {
 }
 
 interface Runtime {
+  /** Session-bound API: never reuse the outgoing factory API after replacement. */
+  api: ExtensionAPI;
   sessionId: string;
   cwd: string;
   state: SupervisorState;
@@ -215,7 +217,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
       const quotas = new QuotaManager({ codexQuotaThresholdPercent: config.codexQuotaThresholdPercent, priorityCandidateIds: getActiveCandidateIds(config) });
       const guard = new ContextGuard({ rotationThresholdPercent: config.rotationThresholdPercent });
       guard.setAutoRotate(config.autoRotate);
-      const r: Runtime = { sessionId: id, cwd: ctx.cwd, state, journal, lock, errors, quotas, guard, autoRotate: config.autoRotate, autoSwitchModel: config.autoSwitchModel, polling: false, inventoryReady: false, modelRevision: 0, disposed: false, dispatched: false, checkpointPrompted: false, pollMs: config.pollIntervalSeconds * 1000, ctx };
+      const r: Runtime = { api: pi, sessionId: id, cwd: ctx.cwd, state, journal, lock, errors, quotas, guard, autoRotate: config.autoRotate, autoSwitchModel: config.autoSwitchModel, polling: false, inventoryReady: false, modelRevision: 0, disposed: false, dispatched: false, checkpointPrompted: false, pollMs: config.pollIntervalSeconds * 1000, ctx };
       reconcileDeliveries(r, ctx);
       runtime = r; persist(r);
       sessionRuntimes.set(ctx.sessionManager, r);
@@ -587,6 +589,9 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
       let replacementContext: any;
       try {
         const parentSession = ctx.sessionManager.getSessionFile();
+        // Plain values only: ctx and pi become invalid when newSession disposes this session.
+        const outgoing = { provider: ctx.model?.provider, id: ctx.model?.id, thinking: pi.getThinkingLevel() };
+        if (!outgoing.provider || !outgoing.id || !outgoing.thinking) throw new Error('Outgoing model or thinking level unavailable');
         const result = await ctx.newSession({
           parentSession,
           setup: async manager => { manager.appendCustomEntry('supervisor-checkpoint', { memoryId: ready.checkpoint.id, parentSession }); },
@@ -600,6 +605,31 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
                 next.state.pendingTaskDeliveries?.length || next.state.pendingJobDeliveries?.length) {
               throw new Error('Replacement supervisor did not initialize safely');
             }
+            // Continuity is an intentional transfer, not automatic slot routing. Restore even
+            // with autoSwitchModel off, through the incoming factory's session-bound API.
+            const api = next.api;
+            const model = fresh.modelRegistry?.find?.(outgoing.provider, outgoing.id);
+            if (!model || model.provider !== outgoing.provider || model.id !== outgoing.id ||
+                typeof api.setModel !== 'function' || typeof api.setThinkingLevel !== 'function' ||
+                typeof api.getThinkingLevel !== 'function') throw new Error('Continuity model restoration unavailable');
+            const revision = next.modelRevision;
+            const safe = () => boundRuntime(sessionRuntimes.get(fresh.sessionManager), fresh) === next &&
+              next.modelRevision === revision && !halted(next) && !hasPending(next) &&
+              !next.state.pendingTaskDeliveries?.length && !next.state.pendingJobDeliveries?.length;
+            next.applyingModel = `${outgoing.provider}/${outgoing.id}`;
+            let restored: boolean;
+            try { restored = await api.setModel(model); }
+            finally { next.applyingModel = undefined; }
+            if (!restored || !safe() || fresh.model?.provider !== outgoing.provider || fresh.model?.id !== outgoing.id) {
+              throw new Error('Continuity model restoration rejected or session changed');
+            }
+            api.setThinkingLevel(outgoing.thinking);
+            if (!safe() || api.getThinkingLevel() !== outgoing.thinking ||
+                fresh.model?.provider !== outgoing.provider || fresh.model?.id !== outgoing.id) {
+              throw new Error('Continuity thinking restoration rejected or session changed');
+            }
+            next.state.activeModel = `${outgoing.provider}/${outgoing.id}` as SupervisorState['activeModel'];
+            persist(next);
             // A rotation must never leave the fresh session silent: it always starts exactly one
             // turn. `continue_task` picks that turn's instruction; it never gates the turn itself.
             const continuation = ready.continueTask

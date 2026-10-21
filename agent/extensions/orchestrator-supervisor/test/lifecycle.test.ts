@@ -99,11 +99,15 @@ function host(mode = 'tui', replacement: { beforeHandover?: (ctx: any, hooks: Ma
     sendUserMessage: (...args: any[]) => sent.push(args),
     sendMessage: (...args: any[]) => sent.push(args),
     getAllTools: () => ['mem_save', 'mem_get_observation', 'subagent_list_tasks', 'job_list', ...Object.keys(overrides.toolResults ?? {})].map(name => ({ name })),
-    setModel: async () => true, setThinkingLevel: () => {},
+    setModel: async () => true,
+    getThinkingLevel: () => ctx.thinkingLevel,
+    setThinkingLevel: (level: string) => { ctx.thinkingLevel = level; },
   };
   const ctx: any = { cwd: dir, mode, hasUI: true, isProjectTrusted: () => true, isIdle: () => true,
     sessionManager: { getSessionId: () => sessionId, getSessionFile: () => 'parent.jsonl', getBranch: () => branch },
     model: { provider: 'custom', id: 'manual', contextWindow: 10000 },
+    thinkingLevel: 'medium',
+    modelRegistry: { find: (provider: string, id: string) => ({ provider, id, contextWindow: 10000 }) },
     getContextUsage: () => ({ tokens: 100, contextWindow: 10000, percent: 1 }),
     ui: { notify: (...args: any[]) => notices.push(args), setStatus: (...args: any[]) => statuses.push(args) },
     tools: pi.getAllTools(),
@@ -128,19 +132,28 @@ function host(mode = 'tui', replacement: { beforeHandover?: (ctx: any, hooks: Ma
       };
       const nextPi = { ...pi,
         // The real replacement API changes the incoming session, not the disposed ctx.
-        setModel: async (model: any) => { fresh.model = model; return true; },
+        setModel: async (model: any) => {
+          fresh.model = model;
+          await nextHooks.get('model_select')?.({ model }, fresh);
+          return true;
+        },
+        getThinkingLevel: () => fresh.thinkingLevel,
+        setThinkingLevel: (level: string) => { fresh.thinkingLevel = level; },
         on: (name: string, fn: any) => nextHooks.set(name, fn),
         registerCommand: (name: string, value: any) => nextCommands.set(name, value),
         registerTool: (value: any) => nextTools.set(value.name, value),
       };
       extension(nextPi, overrides);
-      instances.push({ hooks: nextHooks, commands: nextCommands, tools: nextTools, ctx: fresh });
+      instances.push({ hooks: nextHooks, commands: nextCommands, tools: nextTools, ctx: fresh, pi: nextPi });
       await options.setup?.({ appendCustomEntry: () => {} });
       await nextHooks.get('session_start')({ reason: 'new' }, fresh);
       // Real host contexts throw on every access after shutdown/disposal.
       for (const key of Object.keys(ctx)) Object.defineProperty(ctx, key, {
         configurable: true, get: () => { throw new Error(`Stale context for ${oldId}`); },
       });
+      for (const method of ['setModel', 'getThinkingLevel', 'setThinkingLevel', 'sendMessage', 'sendUserMessage']) {
+        pi[method] = () => { throw new Error(`Stale API for ${oldId}`); };
+      }
       await replacement.beforeHandover?.(fresh, nextHooks, nextCommands);
       await options.withSession?.(fresh);
       return { cancelled: false };
@@ -292,6 +305,81 @@ test('rotation verifies existing tools; reports scheduled, then uses fresh sessi
     assert.equal(h.sent[1][1].triggerTurn, true);
     assert.deepEqual(h.notices.at(-1), ['Session rotated with verified checkpoint #7.', 'info']);
   } finally { await h.close(); }
+});
+
+test('rotation restores the exact outgoing model and thinking before one continuity turn even with autoswitch off', async () => {
+  for (const autoSwitchModel of [false, true]) {
+    const order: string[] = [];
+    let incoming: any;
+    const h = host('tui', { model: { provider: 'default-provider', id: 'default-model' }, beforeHandover: fresh => {
+      incoming = fresh;
+      fresh.thinkingLevel = 'low';
+      const api = h.instances[0].pi;
+      const setModel = api.setModel;
+      api.setModel = async (model: any) => { order.push(`model:${model.provider}/${model.id}`); return setModel(model); };
+      api.setThinkingLevel = (level: string) => { order.push(`thinking:${level}`); fresh.thinkingLevel = level; };
+      const send = fresh.sendMessage;
+      fresh.sendMessage = async (...args: any[]) => {
+        order.push('continuity');
+        assert.equal(fresh.model.provider, 'custom');
+        assert.equal(fresh.model.id, 'account/exact-model');
+        assert.equal(fresh.thinkingLevel, 'xhigh');
+        return send(...args);
+      };
+    } });
+    try {
+      updateSupervisorConfig(h.dir, { autoSwitchModel });
+      await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx);
+      const configBefore = readFileSync(resolveSupervisorConfigPath(h.dir), 'utf8');
+      await h.tools.get('supervisor_rotate').execute('rotate', { summary: '- Goal\n- Next action' }, undefined, undefined, h.ctx);
+      // Capture at the replacement boundary, not at checkpoint preparation.
+      h.ctx.model = { provider: 'custom', id: 'account/exact-model' };
+      h.ctx.thinkingLevel = 'xhigh';
+      await h.commands.get('supervisor-rotate').handler(h.sent[0][0].split(' ')[1], h.ctx);
+      assert.deepEqual(order, ['model:custom/account/exact-model', 'thinking:xhigh', 'continuity']);
+      assert.equal(incoming.model.id, 'account/exact-model');
+      assert.equal(h.sent.filter(a => a[1]?.triggerTurn).length, 1);
+      assert.equal(readFileSync(resolveSupervisorConfigPath(h.dir), 'utf8'), configBefore);
+    } finally { await h.close(); }
+  }
+});
+
+test('restoration failure halts handover visibly without a continuity provider turn', async () => {
+  const cases: Record<string, (fresh: any, api: any, hooks: Map<string, any>) => void> = {
+    'model missing': fresh => { fresh.modelRegistry.find = () => undefined; },
+    'model API missing': (_fresh, api) => { api.setModel = undefined; },
+    'model rejected': (_fresh, api) => { api.setModel = async () => false; },
+    'model throws': (_fresh, api) => { api.setModel = async () => { throw new Error('rejected'); }; },
+    'wrong model readback': (_fresh, api) => { api.setModel = async () => true; },
+    'thinking API missing': (_fresh, api) => { api.setThinkingLevel = undefined; },
+    'thinking clamped': (fresh, api) => { api.setThinkingLevel = () => { fresh.thinkingLevel = 'off'; }; },
+    'thinking throws': (_fresh, api) => { api.setThinkingLevel = () => { throw new Error('thinking rejected'); }; },
+    'thinking readback missing': (_fresh, api) => { api.getThinkingLevel = undefined; },
+    'trust revoked during restore': (fresh, api) => { api.setModel = async (model: any) => { fresh.model = model; fresh.isProjectTrusted = () => false; return true; }; },
+    'model revision changed during restore': (fresh, api, hooks) => { api.setModel = async (model: any) => {
+      fresh.model = model;
+      await hooks.get('model_select')({ model: { provider: 'human', id: 'choice' } }, fresh);
+      return true;
+    }; },
+    'mutation started during restore': (fresh, api, hooks) => { api.setModel = async (model: any) => {
+      fresh.model = model;
+      await hooks.get('tool_call')({ toolCallId: 'race', toolName: 'write', input: { path: 'x', content: 'x' } }, fresh);
+      return true;
+    }; },
+  };
+  for (const [name, damage] of Object.entries(cases)) {
+    const h = host('tui', { model: { provider: 'default', id: 'default' }, beforeHandover: (fresh, hooks) => damage(fresh, h.instances[0].pi, hooks) });
+    try {
+      await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx);
+      await h.tools.get('supervisor_rotate').execute('rotate', { summary: '- Goal\n- Next action' }, undefined, undefined, h.ctx);
+      await h.commands.get('supervisor-rotate').handler(h.sent[0][0].split(' ')[1], h.ctx);
+      assert.equal(h.sent.length, 1, name);
+      assert.match(h.notices.at(-1)[0], /Supervisor handover failed:/, name);
+      assert.equal(h.notices.at(-1)[1], 'error', name);
+      const statePath = join(h.dir, 'runtime', computeFlowIdentity(h.dir, 'session-two'), 'state.json');
+      assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).safetyFault.kind, 'handover', name);
+    } finally { await h.close(); }
+  }
 });
 
 test('a second rotation can be scheduled from the fresh session', async () => {
@@ -1121,7 +1209,7 @@ test('S3: the saved slots route a new session from an outside default without st
   } finally { await h.close(); }
 });
 
-test('rotation selects a configured slot before the only continuity turn, unless autoswitch is off', async () => {
+test('new-session slot routing remains independent; rotation restores outgoing selection before continuity', async () => {
   for (const autoSwitchModel of [true, false]) {
     const initialModel = { provider: 'custom', id: 'default', contextWindow: 10000 };
     let checkedIncoming = false;
@@ -1135,11 +1223,16 @@ test('rotation selects a configured slot before the only continuity turn, unless
       } },
     );
     try {
+      h.ctx.model = { provider: 'manual-provider', id: 'account/intentional', contextWindow: 10000 };
+      h.ctx.thinkingLevel = 'medium';
       await h.tools.get('supervisor_rotate').execute('rotate', { summary: '- Goal\n- Next action', continue_task: true }, undefined, undefined, h.ctx);
       const dispatch = h.sent.find(([message]: any[]) => typeof message === 'string' && message.startsWith('/supervisor-rotate '));
       assert.ok(dispatch);
       await h.commands.get('supervisor-rotate').handler(dispatch[0].split(' ')[1], h.ctx);
       assert.equal(checkedIncoming, true);
+      assert.equal(h.instances[0].ctx.model.provider, 'manual-provider');
+      assert.equal(h.instances[0].ctx.model.id, 'account/intentional');
+      assert.equal(h.instances[0].pi.getThinkingLevel(), 'medium');
       const continuity = h.sent.filter(([message]: any[]) => message.customType === 'supervisor-continuity');
       assert.equal(continuity.length, 1);
       assert.equal(continuity[0][1].triggerTurn, true);

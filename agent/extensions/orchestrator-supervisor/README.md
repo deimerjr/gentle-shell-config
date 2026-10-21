@@ -49,8 +49,8 @@ Models come from Pi's live chat registry (`getAvailable()`, falling back to `get
 | Enabled off | Stops supervisor automation for this project; settings and saved models remain intact. Ordinary user tools are unaffected, except genuine uncertain-effect safety fences. |
 | Auto rotation on | At the configured measured context threshold, asks the agent to checkpoint and rotate. Estimated or unavailable usage does not trigger it. |
 | Auto rotation off | Disables the threshold trigger, not the context safety ceiling or an explicitly requested rotation through the agent. |
-| Auto model switch on | Selects an eligible active-slot model on fresh startup/new sessions, including rotation, before the continuity turn. Handles provider failures and recovery within those selected models. |
-| Auto model switch off | Does not change the model automatically; an interrupted provider-recovery obligation remains pending until re-enabled. |
+| Auto model switch on | Selects an eligible active-slot model on fresh startup/new sessions. A verified rotation then restores the outgoing model and thinking level before continuity. Handles provider failures and recovery within those selected models. |
+| Auto model switch off | Does not assign models automatically; an interrupted provider-recovery obligation remains pending until re-enabled. An intentional verified rotation still transfers the outgoing model and thinking level. |
 | Normal prompt, reload or inventory poll | Does not replace the current model just because a preferred slot becomes available. A manual mid-session model outside the selection stays protected from automatic failover. |
 | No eligible selected model | Reports that selection is unavailable; never chooses a model outside the active saved prefix. |
 | Escape / agent interruption | Cancels the interrupted response's retries, recovery obligation and pending handover without creating a persistent user pause. It does not restart cancelled work on restored quota. |
@@ -83,8 +83,9 @@ The tool:
 
 1. Checks that subagents/jobs are settled and their completion notices are delivered.
 2. Saves the checkpoint through existing `mem_save`, verifies the exact `mem_get_observation` readback, and checks the work fences again.
-3. Dispatches the private token-bound handover immediately. Pi opens a fresh session and invalidates the outgoing context.
-4. Starts exactly one continuity turn. With `continue_task: true`, it resumes unfinished already-authorized work; with false, it reports the pending/blocked state and waits.
+3. Dispatches the private token-bound handover immediately. Captures the outgoing provider, exact model ID (including account route), and thinking level before Pi opens a fresh session and invalidates the outgoing context.
+4. Restores that model and thinking level through the incoming session's API and verifies the result, independently of Auto model switch. No global defaults, saved routing slots or capability switches are changed. If the model/API is unavailable, restoration is rejected, or a safety fence changes during restoration, reports a handover error and sends no continuity turn on the default model.
+5. After successful restoration, starts exactly one continuity turn. With `continue_task: true`, it resumes unfinished already-authorized work; with false, it reports the pending/blocked state and waits.
 
 At the rotation boundary, call the tool once and make no further tool calls in the outgoing turn. The checkpoint is historical context, never new consent for publishing, destructive operations, review grants or unrelated work. Active jobs are not killed to force rotation. Missing/unsupported work-status responses defer rotation rather than guessing.
 
