@@ -152,6 +152,14 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
     try { await refresh; }
     finally { if (r.inventoryRefresh === refresh) r.inventoryRefresh = undefined; }
   };
+  const refreshRecoveryCandidates = async (r: Runtime, ctx: any) => {
+    try { await refreshCandidates(r, ctx); }
+    catch (error) {
+      // Management failure is not missing host authentication. Only explicitly selected
+      // host routes without a quota protocol may recover without management inventory.
+      if (!r.quotas.getCandidates().some(c => c.quotaProtocol === 'none' && selected(r, c.id))) throw error;
+    }
+  };
   const contextMetrics = (r: Runtime, ctx: any) => {
     const usage = ctx.getContextUsage?.();
     if (!usage) return undefined;
@@ -544,7 +552,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
     if (r.polling || r.disposed || halted(r) || (!r.state.owedProviderTurn && !selected(r, modelId(r.ctx)))) return;
     r.polling = true;
     try {
-      await refreshCandidates(r, r.ctx);
+      await refreshRecoveryCandidates(r, r.ctx);
       if (r.disposed || runtime !== r || halted(r)) return;
       if (!selected(r, modelId(r.ctx))) return;
       if (r.state.owedProviderTurn && r.autoSwitchModel && r.state.status === 'idle') {
@@ -835,6 +843,24 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
       return;
     }
     r.pendingAction = action;
+    // Pi's built-in retry runs before agent_before_settle. For explicit account quota
+    // exhaustion, move its next request to an eligible route at this earlier boundary.
+    // Do not add a continuation: the host still owns retry scheduling and error history.
+    const explicitCooldown = /model_cooldown|individual quota reached/i.test(event.message?.errorMessage ?? '');
+    if (action.type === 'immediate_failover' && action.isHardQuota && explicitCooldown &&
+        isSelectedModel && r.autoSwitchModel) {
+      const revision = r.modelRevision;
+      r.state.owedProviderTurn = true; persist(r);
+      try {
+        await refreshRecoveryCandidates(r, ctx);
+        const best = await r.quotas.selectBestCandidate(r.errors.getCooldowns(), { forceFresh: true, excluded: r.errors.getExcludedCandidates() });
+        if (bound(ctx) !== r || revision !== r.modelRevision || halted(r) || ctx.signal?.aborted) return;
+        if (best.candidate && await updateModel(r, ctx, best.candidate.id)) {
+          r.pendingAction = undefined;
+          r.state.owedProviderTurn = false; r.state.status = 'active'; persist(r);
+        }
+      } catch { /* Preserve the obligation for the settlement/polling recovery path. */ }
+    }
   });
   pi.on('agent_before_settle', async (event, ctx) => {
     const r = bound(ctx); if (!r || halted(r) || event.outcome === 'aborted' || r.ready) return;
@@ -862,7 +888,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
       }
       let best;
       try {
-        await refreshCandidates(r, ctx);
+        await refreshRecoveryCandidates(r, ctx);
         best = await r.quotas.selectBestCandidate(r.errors.getCooldowns(), { forceFresh: true, excluded: r.errors.getExcludedCandidates() });
       } catch {
         if (bound(ctx) === r && revision === r.modelRevision && !halted(r)) {

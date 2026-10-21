@@ -773,6 +773,56 @@ const failedMessage = { role: 'assistant', stopReason: 'error', errorMessage: 'i
 // a recovery message (or omit the failed assistant) before requesting a call.
 const errorBoundary = () => ({ outcome: 'error', entries: [], continue: false, context: { canContinue: false } });
 
+test('hard quota switches a registered selected model at turn_end despite unavailable management inventory', async () => {
+  const h = host();
+  try {
+    const models = ['Gem_1/claude-sonnet-4-6', 'Gem_2/claude-sonnet-4-6'].map(id => ({ provider: 'cpamc', id, contextWindow: 200000 }));
+    updateSupervisorConfig(h.dir, { priorityCandidateIds: models.map(m => `${m.provider}/${m.id}`) });
+    h.ctx.model = models[0];
+    h.ctx.modelRegistry.getAvailable = () => models;
+    h.pi.setModel = async (model: any) => { h.ctx.model = model; return true; };
+    await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx);
+    const result = await h.hooks.get('turn_end')({ message: { role: 'assistant', stopReason: 'error', errorMessage: '429: {"code":"model_cooldown","reset_seconds":542963}' } }, h.ctx);
+    assert.equal(h.ctx.model.id, models[1].id, 'the next host retry must not use the exhausted route');
+    assert.equal(result, undefined, 'do not request a second provider continuation alongside the host retry');
+    assert.equal(await h.hooks.get('agent_before_settle')(errorBoundary(), h.ctx), undefined);
+    assert.equal(h.sent.length, 0);
+  } finally { await h.close(); }
+});
+
+test('early hard-quota failover respects autoswitch, manual models and configured slots', async () => {
+  for (const scenario of ['disabled', 'manual', 'missing-slot']) {
+    const h = host();
+    try {
+      const models = ['one', 'two'].map(id => ({ provider: 'cpamc', id, contextWindow: 200000 }));
+      updateSupervisorConfig(h.dir, {
+        autoSwitchModel: scenario !== 'disabled',
+        priorityCandidateIds: scenario === 'missing-slot' ? ['cpamc/one', 'cpamc/missing'] : models.map(m => `${m.provider}/${m.id}`),
+      });
+      h.ctx.model = scenario === 'manual' ? { ...models[0], id: 'manual' } : models[0];
+      h.ctx.modelRegistry.getAvailable = () => models;
+      h.pi.setModel = async (model: any) => { h.ctx.model = model; return true; };
+      await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx);
+      const initial = h.ctx.model.id;
+      await h.hooks.get('turn_end')({ message: { role: 'assistant', stopReason: 'error', errorMessage: '429: {"code":"model_cooldown","reset_seconds":542963}' } }, h.ctx);
+      assert.equal(h.ctx.model.id, initial, scenario);
+    } finally { await h.close(); }
+  }
+});
+
+test('ordinary 429 does not switch registered models at turn_end', async () => {
+  const h = host();
+  try {
+    const models = ['one', 'two'].map(id => ({ provider: 'cpamc', id, contextWindow: 200000 }));
+    updateSupervisorConfig(h.dir, { priorityCandidateIds: models.map(m => `${m.provider}/${m.id}`) });
+    h.ctx.model = models[0]; h.ctx.modelRegistry.getAvailable = () => models;
+    h.pi.setModel = async (model: any) => { h.ctx.model = model; return true; };
+    await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx);
+    await h.hooks.get('turn_end')({ message: { role: 'assistant', stopReason: 'error', errorMessage: '429 Too many requests' } }, h.ctx);
+    assert.equal(h.ctx.model.id, 'one');
+  } finally { await h.close(); }
+});
+
 test('exhausted accounts wait without prompts; quota recovery wakes only one owed provider turn', async () => {
   const h = await quotaHost();
   try {
