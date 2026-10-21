@@ -71,8 +71,10 @@ const sessionRuntimes = new WeakMap<object, Runtime>();
 const sessionId = (ctx: any) => ctx.sessionManager?.getSessionId?.();
 // The environment opt-in gates loading; the persisted per-project flag gates acting.
 // Both are re-read on every bind so a live toggle takes effect before the next handler.
+const isParentSession = (ctx: any): boolean =>
+  (ctx.mode === 'tui' || ctx.mode === 'rpc') && process.env.GENTLE_PI_AGENTS_CHILD !== '1';
 const boundRuntime = (r: Runtime | undefined, ctx: any): Runtime | undefined => r && !r.disposed &&
-  ctx.mode === 'tui' && r.sessionId === sessionId(ctx) && r.cwd === ctx.cwd &&
+  isParentSession(ctx) && r.sessionId === sessionId(ctx) && r.cwd === ctx.cwd &&
   (!ctx.isProjectTrusted || ctx.isProjectTrusted()) &&
   isExtensionEnabled(SUPERVISOR_EXTENSION_NAME, ctx.cwd) && isSupervisorEnabled(ctx.cwd) ? r : undefined;
 
@@ -180,7 +182,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
    * and drives the classifier, quota manager and context guard.
    */
   function ensureRuntime(ctx: any): Runtime | undefined {
-    if (ctx.mode !== 'tui' || !sessionId(ctx) || (ctx.isProjectTrusted && !ctx.isProjectTrusted()) ||
+    if (!isParentSession(ctx) || !sessionId(ctx) || (ctx.isProjectTrusted && !ctx.isProjectTrusted()) ||
         !isExtensionEnabled(SUPERVISOR_EXTENSION_NAME, ctx.cwd)) return undefined;
     const loaded = loadSupervisorConfig(ctx.cwd);
     // A runtime this process already started must not outlive its own control file (S7):
@@ -366,6 +368,10 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
    * closes without writing when its session was replaced.
    */
   async function openSupervisorPanel(ctx: any): Promise<void> {
+    if (ctx.mode !== 'tui') {
+      notify(ctx, 'The supervisor runs in RPC, but its configuration panel requires a Pi terminal. Configure /supervisor there for this same project directory.', 'warning');
+      return;
+    }
     const loaded = loadSupervisorConfig(ctx.cwd);
     if (loaded.error) {
       notify(ctx, `Supervisor panel unavailable: ${loaded.error}`, 'warning');
@@ -690,7 +696,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
     reachesTools: () => ['mem_save', 'mem_get_observation', 'subagent_list_tasks', 'job_list'],
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const r = bound(ctx);
-      if (!r) throw new Error('Supervisor inactive; requires an interactive parent session');
+      if (!r) throw new Error('Supervisor inactive; requires a trusted TUI or RPC parent session');
       if (halted(r)) throw new Error(haltedMessage(r));
       if (preparing || r.ready) throw new Error('Supervisor checkpoint already in progress or scheduled');
       preparing = true;

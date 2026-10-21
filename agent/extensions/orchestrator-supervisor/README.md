@@ -63,6 +63,10 @@ If management inventory is unavailable (including HTTP 403), recovery may still 
 
 Transient provider failures, including ordinary RPM 429 throttling, retry the current selected model without applying quota-reset metadata. The configured consecutive-failure limit starts its cooldown and selects another eligible model. If none is available, polling can resume **only** the response actually interrupted by a provider error. Completed work, new user input, manual model selection, disabling the supervisor and agent interruption do not create background prompts.
 
+### Pi Desktop and other RPC parents
+
+Orchestrator automation runs in trusted TUI and RPC parent sessions, including Pi Desktop. Marked Gentle Agents children (`GENTLE_PI_AGENTS_CHILD=1`) are excluded from parent automation; JSON/print runs remain excluded. RPC uses the same per-project configuration, quota recovery and session safety fences as TUI. The custom `/supervisor` configuration panel is terminal-only: open Pi in the exact Desktop workspace directory to configure its slots, or use the configuration API. Desktop worktrees have their own project identity; settings from the original checkout are not inherited. Slot IDs must match the actual provider route (for example `cpamc/Gem_1/claude-sonnet-4-6`, not `cliproxyapi/...` when the session uses `cpamc`). After updating an installed extension, reload/restart the affected runtime; replacing files does not update factories already loaded in memory.
+
 The table above applies only to **Orchestrator**. Subagent assignment is separate:
 
 | Condition | Child behavior |

@@ -118,7 +118,7 @@ export class ErrorClassifier {
     options?: { freshQuotaStatus?: CandidateQuotaStatus },
   ): ClassificationAction {
     // 1. Strict filter: TUI mode and active orchestrator session only
-    if (ctx.mode !== 'tui' || ctx.sessionId !== this.activeOrchestratorSessionId) {
+    if (!['tui', 'rpc'].includes(ctx.mode) || ctx.sessionId !== this.activeOrchestratorSessionId) {
       return { type: 'ignored' };
     }
 

@@ -14,13 +14,20 @@ test('MINI-003: Tool errors, bash failures, and subagent task errors are ignored
   assert.equal(action1.type, 'ignored');
   assert.equal(classifier.getConsecutiveErrors('cliproxyapi/main/gpt-6.1-sol'), 0);
 
-  // Assistant turn in non-tui or different session
+  // A different session is never the supervised parent.
   const diffSessionMsg = { role: 'assistant', stopReason: 'error', errorMessage: '429 Rate limit' };
   const action2 = classifier.handleMessageEnd(diffSessionMsg, 'cliproxyapi/main/gpt-6.1-sol', {
     mode: 'rpc',
-    sessionId: 'session-orch-1',
+    sessionId: 'another-session',
   });
   assert.equal(action2.type, 'ignored');
+});
+
+test('RPC parent hard quota is classified; print/json remains excluded', () => {
+  const classifier = new ErrorClassifier('parent');
+  const message = { role: 'assistant', stopReason: 'error', errorMessage: 'Individual quota reached' };
+  assert.equal(classifier.handleMessageEnd(message, 'cpamc/Gem_1/claude-sonnet-4-6', { mode: 'rpc', sessionId: 'parent' }).type, 'immediate_failover');
+  assert.equal(classifier.handleMessageEnd(message, 'cpamc/other', { mode: 'json', sessionId: 'parent' }).type, 'ignored');
 });
 
 test('MINI-003: Hard quota exhaustion triggers immediate abort and candidate exclusion without 3 retries', () => {

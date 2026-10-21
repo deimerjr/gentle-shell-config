@@ -286,6 +286,34 @@ test('loads standalone; child sessions do not initialize or execute supervisor',
   } finally { await h.close(); }
 });
 
+test('RPC parent rotates with verified continuity and a fresh session', async () => {
+  const h = host('rpc');
+  try {
+    await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx);
+    await h.tools.get('supervisor_rotate').execute('rotate', { summary: '- Goal\n- Next action' }, undefined, undefined, h.ctx);
+    const token = h.sent[0][0].split(' ')[1];
+    await h.commands.get('supervisor-rotate').handler(token, h.ctx);
+    assert.equal(h.instances.length, 1);
+    assert.equal(h.instances[0].ctx.mode, 'rpc');
+    assert.equal(h.sent.filter(([message]: any[]) => message?.customType === 'supervisor-continuity').length, 1);
+  } finally { await h.close(); }
+});
+
+test('marked RPC children never initialize parent supervisor or rotate', async () => {
+  const previous = process.env.GENTLE_PI_AGENTS_CHILD;
+  process.env.GENTLE_PI_AGENTS_CHILD = '1';
+  const h = host('rpc');
+  try {
+    await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx);
+    await assert.rejects(h.tools.get('supervisor_rotate').execute('rotate', { summary: 'child' }, undefined, undefined, h.ctx), /inactive/i);
+    assert.equal(h.sent.length, 0);
+  } finally {
+    await h.close();
+    if (previous === undefined) delete process.env.GENTLE_PI_AGENTS_CHILD;
+    else process.env.GENTLE_PI_AGENTS_CHILD = previous;
+  }
+});
+
 test('rotation verifies existing tools; reports scheduled, then uses fresh session context', async () => {
   const h = host();
   try {
@@ -774,7 +802,7 @@ const failedMessage = { role: 'assistant', stopReason: 'error', errorMessage: 'i
 const errorBoundary = () => ({ outcome: 'error', entries: [], continue: false, context: { canContinue: false } });
 
 test('hard quota switches a registered selected model at turn_end despite unavailable management inventory', async () => {
-  const h = host();
+  const h = host('rpc');
   try {
     const models = ['Gem_1/claude-sonnet-4-6', 'Gem_2/claude-sonnet-4-6'].map(id => ({ provider: 'cpamc', id, contextWindow: 200000 }));
     updateSupervisorConfig(h.dir, { priorityCandidateIds: models.map(m => `${m.provider}/${m.id}`) });
