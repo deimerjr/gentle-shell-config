@@ -98,7 +98,9 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
   const bound = (ctx: any): Runtime | undefined => {
     if (runtime && !runtime.disposed && !isSupervisorEnabled(ctx.cwd)) teardownRuntime(ctx);
     if (!runtime || runtime.disposed) ensureRuntime(ctx);
-    return boundRuntime(runtime, ctx);
+    const live = boundRuntime(runtime, ctx);
+    if (live) applyLiveConfig(ctx, loadSupervisorConfig(ctx.cwd).config);
+    return live;
   };
   const persist = (r: Runtime) => { r.state.updatedAt = Date.now(); r.journal.saveState(r.state); };
   /**
@@ -273,6 +275,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
   const applyLiveConfig = (ctx: any, next: SupervisorConfig): void => {
     const live = boundRuntime(runtime, ctx);
     if (!live) return;
+    live.autoRotate = next.autoRotate;
     applyLiveSupervisorConfig({
       quotas: live.quotas,
       guard: live.guard,
@@ -555,6 +558,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
     // A reload reaches the poll with an empty catalogue, so slot membership cannot be decided
     // yet. An owed provider turn always discovers first; without debt the gate stays as before,
     // so a model outside the saved slots is still never polled for.
+    applyLiveConfig(r.ctx, loadSupervisorConfig(r.cwd).config);
     if (r.polling || r.disposed || halted(r) || (!r.state.owedProviderTurn && !selected(r, modelId(r.ctx)))) return;
     r.polling = true;
     try {

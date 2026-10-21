@@ -109,7 +109,9 @@ Legacy pause/cancel flags and separate model-routing preferences no longer contr
 
 ## Configuration and storage
 
-Per-project configuration and runtime documents live under `.runtime/<project identity>/` (or `GENTLE_SUPERVISOR_RUNTIME_DIR`):
+Global configuration defaults live under `.runtime/global/supervisor.json` and `.runtime/global/subagents.json` (or the same paths under `GENTLE_SUPERVISOR_RUNTIME_DIR`). Existing per-project documents override the complete global document independently for each tab; missing project files inherit global defaults. Missing global files use built-in defaults. Invalid effective files fail closed. Desktop's Supervisor module edits these documents through the installed plugin's `src/management-api.ts`, using the same validation, atomic writes and locks. Returning a project to inheritance removes only its configuration override, never its runtime state. Enabling a disabled supervisor still requires the trusted terminal safety confirmation.
+
+Per-project configuration overrides and runtime documents live under `.runtime/<project identity>/` (or `GENTLE_SUPERVISOR_RUNTIME_DIR`):
 
 | File | Contents |
 | --- | --- |

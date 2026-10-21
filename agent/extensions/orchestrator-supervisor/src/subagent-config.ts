@@ -1,6 +1,7 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { computeFlowIdentity, resolveSupervisorDir } from './config.ts';
+import { effectiveConfigPath, globalConfigPath } from './config-scope.ts';
 import { isValidCandidateId } from './candidate-id.ts';
 import { withExclusiveFileLock, writeJsonAtomic } from './atomic-json.ts';
 
@@ -188,7 +189,7 @@ function readStoredConfig(path: string): { config: SubagentConfig; source: 'file
  * Orchestrator and must not change what the Subagents view reports or stores.
  */
 export function loadSubagentConfig(cwd: string, flowKey?: string): SubagentConfigLoad {
-  const path = resolveSubagentConfigPath(cwd, flowKey);
+  const path = effectiveConfigPath(resolveSubagentConfigPath(cwd, flowKey), 'subagents.json');
   try {
     return readStoredConfig(path);
   } catch (err: any) {
@@ -216,10 +217,10 @@ function persist(path: string, config: SubagentConfig): SubagentConfig {
  * invalid or duplicate model) throws before `writeJsonAtomic`, so the stored bytes stay
  * exactly as they were.
  */
-export function updateSubagentConfig(cwd: string, patch: Partial<SubagentConfig>, flowKey?: string): SubagentConfig {
-  const path = resolveSubagentConfigPath(cwd, flowKey);
+export function updateSubagentConfig(cwd: string, patch: Partial<SubagentConfig>, flowKey?: string, scope: 'project' | 'global' = 'project'): SubagentConfig {
+  const path = scope === 'global' ? globalConfigPath('subagents.json') : resolveSubagentConfigPath(cwd, flowKey);
   return withExclusiveFileLock(path, CONFIG_LABEL, () => {
-    const stored = readStoredConfig(path);
+    const stored = readStoredConfig(scope === 'project' && !existsSync(path) ? globalConfigPath('subagents.json') : path);
     return persist(path, { ...stored.config, ...patch });
   });
 }

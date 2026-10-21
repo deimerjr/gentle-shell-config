@@ -1,6 +1,7 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { computeFlowIdentity, resolveSupervisorDir } from './config.ts';
+import { effectiveConfigPath, globalConfigPath } from './config-scope.ts';
 import { isValidCandidateId } from './candidate-id.ts';
 import { withExclusiveFileLock, writeJsonAtomic } from './atomic-json.ts';
 
@@ -199,7 +200,7 @@ function readStoredConfig(path: string): { config: SupervisorConfig; source: 'fi
  * an unreadable control must not silently leave automatic actions running.
  */
 export function loadSupervisorConfig(cwd: string, flowKey?: string): SupervisorConfigLoad {
-  const path = resolveSupervisorConfigPath(cwd, flowKey);
+  const path = effectiveConfigPath(resolveSupervisorConfigPath(cwd, flowKey), 'supervisor.json');
   try {
     const { config, source } = readStoredConfig(path);
     if (process.env.GENTLE_SUPERVISOR_DISABLED === '1') {
@@ -242,10 +243,10 @@ export function saveSupervisorConfig(cwd: string, config: SupervisorConfig, flow
  * Applies a partial change to the stored document. Re-reads inside the lock so a
  * concurrent writer cannot be clobbered, and refuses to overwrite an unusable file.
  */
-export function updateSupervisorConfig(cwd: string, patch: Partial<SupervisorConfig>, flowKey?: string): SupervisorConfig {
-  const path = resolveSupervisorConfigPath(cwd, flowKey);
+export function updateSupervisorConfig(cwd: string, patch: Partial<SupervisorConfig>, flowKey?: string, scope: 'project' | 'global' = 'project'): SupervisorConfig {
+  const path = scope === 'global' ? globalConfigPath('supervisor.json') : resolveSupervisorConfigPath(cwd, flowKey);
   return withExclusiveFileLock(path, CONFIG_LABEL, () => {
-    const stored = readStoredConfig(path);
+    const stored = readStoredConfig(scope === 'project' && !existsSync(path) ? globalConfigPath('supervisor.json') : path);
     return persist(path, { ...stored.config, ...patch });
   });
 }
