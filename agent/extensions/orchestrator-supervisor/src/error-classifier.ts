@@ -188,8 +188,25 @@ export class ErrorClassifier {
       };
     }
 
+    // CLIProxyAPI may prefix its JSON envelope with `Error: 429:`. Parse only
+    // the outer object: nested upstream error strings are not reset metadata.
+    let envelope: Record<string, unknown> | undefined;
+    try {
+      const jsonStart = rawError.indexOf('{');
+      if (jsonStart >= 0) {
+        const parsed: unknown = JSON.parse(rawError.slice(jsonStart));
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          envelope = parsed as Record<string, unknown>;
+        }
+      }
+    } catch {
+      // Plain text / malformed envelopes still use the configured cooldown.
+    }
+
     // Check hard quota exhaustion or complete capacity/auth unavailability
     const isLiteralHardQuota =
+      envelope?.code === 'model_cooldown' ||
+      lower.includes('individual quota reached') ||
       lower.includes('insufficient_quota') ||
       lower.includes('quota exceeded') ||
       lower.includes('out of budget') ||
@@ -209,7 +226,10 @@ export class ErrorClassifier {
       !options.freshQuotaStatus.isUnknown;
 
     if (isLiteralHardQuota || isQuotaConfirmedExhausted || isNoCapacityOrNoAuth) {
-      this.setCooldown(candidateId, this.cooldownMs);
+      const resetSeconds = envelope?.reset_seconds;
+      const resetMs = typeof resetSeconds === 'number' && resetSeconds > 0
+        && Number.isFinite(resetSeconds * 1000) ? resetSeconds * 1000 : 0;
+      this.setCooldown(candidateId, Math.max(this.cooldownMs, resetMs));
       return {
         type: 'immediate_failover',
         isHardQuota: true,

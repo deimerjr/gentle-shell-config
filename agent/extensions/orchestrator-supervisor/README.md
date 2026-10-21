@@ -57,7 +57,9 @@ Models come from Pi's live chat registry (`getAvailable()`, falling back to `get
 
 User order decides between eligible slots. A model without a supported quota protocol yields to an eligible verified slot below it and is otherwise a fallback. Codex requires both quota windows below the configured threshold; Gemini requires positive remaining quota. Cooldowns, rejected credentials, missing quota proof and exclusions remain safety constraints, not permission to choose an unselected model.
 
-Transient provider failures retry the current selected model. The configured consecutive-failure limit starts its cooldown and selects another eligible model. If none is available, polling can resume **only** the response actually interrupted by a provider error. Completed work, new user input, manual model selection, disabling the supervisor and agent interruption do not create background prompts.
+Hard quota exhaustion, including CLIProxyAPI's `model_cooldown` envelope or `Individual quota reached`, cancels retry sleep and immediately fails over to another eligible selected model. A finite positive numeric `reset_seconds` in the outer JSON envelope extends the candidate's cooldown to at least the provider reset; it never shortens the configured minimum. Missing, invalid or nested reset metadata uses the configured cooldown.
+
+Transient provider failures, including ordinary RPM 429 throttling, retry the current selected model without applying quota-reset metadata. The configured consecutive-failure limit starts its cooldown and selects another eligible model. If none is available, polling can resume **only** the response actually interrupted by a provider error. Completed work, new user input, manual model selection, disabling the supervisor and agent interruption do not create background prompts.
 
 The table above applies only to **Orchestrator**. Subagent assignment is separate:
 

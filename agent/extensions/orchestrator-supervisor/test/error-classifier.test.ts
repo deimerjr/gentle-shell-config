@@ -42,6 +42,94 @@ test('MINI-003: Hard quota exhaustion triggers immediate abort and candidate exc
   assert.equal(action.shouldAbortRetry, true);
 });
 
+test('CLIProxyAPI model_cooldown aborts retries immediately and honours the provider reset', () => {
+  const classifier = new ErrorClassifier('session-orch-1', { cooldownMs: 120000 });
+  const candidate = 'cpamc/Gem_1/claude-sonnet-4-6';
+  const ctx = { mode: 'tui', sessionId: 'session-orch-1' };
+  const payload = {
+    code: 'model_cooldown',
+    last_upstream_error: JSON.stringify({ error: {
+      code: 429,
+      message: 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 150h49m43s.',
+      status: 'RESOURCE_EXHAUSTED',
+    } }),
+    message: 'All credentials for model Gem_1/claude-sonnet-4-6 are cooling down',
+    model: 'Gem_1/claude-sonnet-4-6',
+    reset_seconds: 542963,
+    reset_time: '150h49m22s',
+  };
+  // The envelope code alone must suffice, even without the nested quota message.
+  for (const last_upstream_error of [payload.last_upstream_error, undefined]) {
+    const before = Date.now();
+    const action = classifier.handleMessageEnd({
+      role: 'assistant', stopReason: 'error',
+      errorMessage: `Error: 429: ${JSON.stringify({ ...payload, last_upstream_error })}`,
+    }, candidate, ctx);
+    assert.equal(action.type, 'immediate_failover');
+    assert.equal(action.isHardQuota, true);
+    assert.equal(action.shouldAbortRetry, true);
+    assert.equal(classifier.getConsecutiveErrors(candidate), 0);
+    const until = classifier.getCooldowns().get(candidate)!;
+    assert.ok(until >= before + 542963000 && until <= Date.now() + 542963000);
+  }
+});
+
+test('Individual quota reached is hard quota; reset_seconds never shortens the configured minimum', () => {
+  const candidate = 'cpamc/Gem_1/claude-sonnet-4-6';
+  const ctx = { mode: 'tui', sessionId: 'session-orch-1' };
+  for (const reset_seconds of [undefined, null, '542963', 0, -1, 1, 1e308, {}, []]) {
+    const classifier = new ErrorClassifier('session-orch-1', { cooldownMs: 120000 });
+    const before = Date.now();
+    const action = classifier.handleMessageEnd({
+      role: 'assistant', stopReason: 'error',
+      errorMessage: `Error: 429: ${JSON.stringify({ message: 'Individual quota reached.', reset_seconds })}`,
+    }, candidate, ctx);
+    assert.equal(action.type, 'immediate_failover');
+    assert.equal(action.shouldAbortRetry, true);
+    const until = classifier.getCooldowns().get(candidate)!;
+    assert.ok(until >= before + 120000 && until <= Date.now() + 120000, JSON.stringify(reset_seconds));
+  }
+});
+
+test('Hard quota ignores malformed JSON and nested reset_seconds instead of loosely extracting them', () => {
+  const candidate = 'cliproxyapi/main/gpt-6.1-sol';
+  for (const errorMessage of [
+    'Error: 429: {"code":"insufficient_quota","reset_seconds":542963',
+    `Error: 429: ${JSON.stringify({ code: 'insufficient_quota', last_upstream_error: JSON.stringify({ reset_seconds: 542963 }) })}`,
+  ]) {
+    const classifier = new ErrorClassifier('session-orch-1', { cooldownMs: 120000 });
+    const before = Date.now();
+    const action = classifier.handleMessageEnd({ role: 'assistant', stopReason: 'error', errorMessage }, candidate,
+      { mode: 'tui', sessionId: 'session-orch-1' });
+    assert.equal(action.type, 'immediate_failover');
+    const until = classifier.getCooldowns().get(candidate)!;
+    assert.ok(until >= before + 120000 && until <= Date.now() + 120000);
+  }
+});
+
+test('Ordinary RPM 429 retains bounded retries and ignores provider reset metadata', () => {
+  const candidate = 'cliproxyapi/main/gpt-6.1-sol';
+  for (const errorMessage of [
+    'HTTP 429 Too Many Requests Retry-After: 60',
+    `Error: 429: ${JSON.stringify({ message: 'Too many requests', reset_seconds: 542963,
+      last_upstream_error: JSON.stringify({ code: 'model_cooldown', reset_seconds: 542963 }) })}`,
+  ]) {
+    const classifier = new ErrorClassifier('session-orch-1', { cooldownMs: 120000 });
+    const msg = { role: 'assistant', stopReason: 'error', errorMessage };
+    const ctx = { mode: 'tui', sessionId: 'session-orch-1' };
+    const first = classifier.handleMessageEnd(msg, candidate, ctx);
+    assert.equal(first.type, 'transient_retry');
+    assert.equal(first.shouldAbortRetry, false);
+    assert.equal(first.retryDelayMs, errorMessage.includes('Retry-After') ? 30000 : 1000);
+    assert.equal(classifier.isInCooldown(candidate), false);
+    assert.equal(classifier.handleMessageEnd(msg, candidate, ctx).type, 'transient_retry');
+    const before = Date.now();
+    assert.equal(classifier.handleMessageEnd(msg, candidate, ctx).type, 'cooldown_failover');
+    const until = classifier.getCooldowns().get(candidate)!;
+    assert.ok(until >= before + 120000 && until <= Date.now() + 120000);
+  }
+});
+
 test('MINI-003: Upstream auth_unavailable / no capacity triggers immediate failover without 3 retries', () => {
   const classifier = new ErrorClassifier('session-orch-1');
 
