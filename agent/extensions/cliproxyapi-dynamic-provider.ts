@@ -242,12 +242,27 @@ async function fetchCLIProxyModels(signal?: AbortSignal) {
         .filter((model): model is NonNullable<ReturnType<typeof toPiModelFromOpenAI>> => Boolean(model));
 }
 
-export default function cliproxyapiDynamicProvider(pi: ExtensionAPI) {
+export default async function cliproxyapiDynamicProvider(pi: ExtensionAPI) {
+    // Pi awaits the factory before startup model selection; RPC refresh runs later.
+    // Use one deadline for discovery and its fallback, without persisting a catalog.
+    requireApiKey();
+    let models: Awaited<ReturnType<typeof fetchCLIProxyModels>>;
+    try {
+        models = await fetchCLIProxyModels(AbortSignal.timeout(15_000));
+    } catch {
+        // Do not expose upstream bodies, URLs, or authentication details in startup diagnostics.
+        throw new Error("CLIProxyAPI startup model discovery failed (15s deadline). Check endpoint availability and authentication.");
+    }
+    if (models.length === 0) {
+        throw new Error("CLIProxyAPI startup model discovery returned an empty catalog.");
+    }
+
     pi.registerProvider(PROVIDER_ID, {
         name: "CLIProxyAPI",
         baseUrl: `${resolveBaseUrl()}/v1`,
         apiKey: "$CLIPROXYAPI_API_KEY",
         api: "openai-completions",
+        models,
         compat: {
             supportsDeveloperRole: false,
             supportsReasoningEffort: true,
