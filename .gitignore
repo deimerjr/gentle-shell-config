@@ -51,3 +51,5 @@ sessions/
 # Internal ODD working documents (specs, decision logs, session evidence).
 # Kept on disk for local continuity; never published.
 odd/
+# Local Pi runtime state
+.atl/

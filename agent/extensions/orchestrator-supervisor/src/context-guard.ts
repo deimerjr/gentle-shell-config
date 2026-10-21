@@ -149,7 +149,7 @@ export class ContextGuard {
     const providerCap = this.getProviderContextWindowCap(activeModelId, rawUsage.contextWindow);
     const effectiveWindow = Math.min(rawUsage.contextWindow || providerCap, providerCap);
 
-    if (rawUsage.tokens !== null && typeof rawUsage.tokens === 'number') {
+    if (typeof rawUsage.tokens === 'number' && Number.isFinite(rawUsage.tokens) && rawUsage.tokens >= 0) {
       const tokens = rawUsage.tokens;
       const percent = (tokens / effectiveWindow) * 100;
       const isReserveExceeded = percent >= this.rotationThresholdPercent;
@@ -220,7 +220,7 @@ export class ContextGuard {
     if (currentEstimatedTokens >= ceilingTokens) {
       const consequence = this.autoRotate
         ? 'Rotación automática de sesión programada al finalizar el turno.'
-        : 'Rotación automática deshabilitada en el panel: ejecutá /supervisor y usá la acción «rotate now», o liberá contexto.';
+        : 'Rotación automática deshabilitada en el panel: pedí al agente que use supervisor_rotate, o liberá contexto.';
       return {
         block: true,
         terminate: true,

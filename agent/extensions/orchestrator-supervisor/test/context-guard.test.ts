@@ -235,10 +235,9 @@ test('S9: the ceiling reason never promises an automatic rotation that is switch
   assert.equal(blocked.terminate, true);
   assert.match(blocked.reason, /Límite de seguridad de contexto alcanzado \(90%\)/);
   assert.doesNotMatch(blocked.reason, /Rotación automática de sesión programada/);
-  // The guidance must point at the only remaining human surface: the bare command and the
-  // panel action. A removed subcommand is what this assertion exists to prevent.
-  assert.match(blocked.reason, /\/supervisor\b/);
-  assert.match(blocked.reason, /«rotate now»/);
+  // Rotation is requested through the agent tool, not a removed panel action.
+  assert.match(blocked.reason, /supervisor_rotate/);
+  assert.doesNotMatch(blocked.reason, /rotate now/);
   assert.doesNotMatch(blocked.reason, /\/supervisor (status|models|pause|resume|cancel|rotate|panel)\b/);
 
   guard.setAutoRotate(true);
@@ -246,6 +245,20 @@ test('S9: the ceiling reason never promises an automatic rotation that is switch
     guard.interceptToolCall({ toolName: 'bash', input: {} }, 245000, 272000)!.reason,
     /Rotación automática de sesión programada al finalizar el turno\./,
   );
+});
+
+test('invalid token counts use the branch estimate instead of bypassing the ceiling', () => {
+  const guard = new ContextGuard();
+  for (const tokens of [NaN, Infinity, -Infinity, -1]) {
+    const metrics = guard.evaluateUsage(
+      { tokens, contextWindow: 10000, percent: null }, 'custom/manual',
+      { systemPrompt: '', entriesChars: 39600 },
+    );
+    assert.equal(metrics.isFallback, true);
+    assert.equal(metrics.tokens, 9900);
+    assert.equal(metrics.isReserveExceeded, true);
+  }
+  assert.equal(guard.evaluateUsage({ tokens: 0, contextWindow: 10000, percent: 0 }, 'custom/manual').isFallback, false);
 });
 
 test('S6: a live ContextGuard adopts a rotation threshold changed from the panel', () => {

@@ -930,6 +930,25 @@ test('S9: with automatic rotation on, the boundary still requests the checkpoint
   } finally { await h.close(); }
 });
 
+test('estimated context uses the same branch budget for tool blocking and checkpoint requests', async () => {
+  for (const autoRotate of [true, false]) {
+    const h = host();
+    try {
+      updateSupervisorConfig(h.dir, { autoRotate });
+      await h.hooks.get('session_start')({ reason: 'startup' }, h.ctx);
+      h.ctx.getContextUsage = () => ({ tokens: null, contextWindow: 10000, percent: null });
+      h.ctx.sessionManager.getBranch().push({ type: 'message', message: { role: 'user', content: 'x'.repeat(39600) } });
+      const blocked = await h.hooks.get('tool_call')({ toolName: 'read', toolCallId: 'estimated-read', input: { path: 'file.ts' } }, h.ctx);
+      assert.equal(blocked?.block, true, 'estimated usage above the ceiling must fence ordinary tools');
+      for (const toolName of ['mem_save', 'supervisor_rotate', 'job_list']) {
+        assert.equal(await h.hooks.get('tool_call')({ toolName, toolCallId: `essential-${toolName}`, input: {} }, h.ctx), undefined);
+      }
+      const result = await h.hooks.get('agent_before_settle')({ outcome: 'success' }, h.ctx);
+      assert.equal(result?.continue, autoRotate ? true : undefined);
+    } finally { await h.close(); }
+  }
+});
+
 test('normal assistant-final idle settlement (canContinue=false) requests checkpoint at threshold and suppresses duplicates', async () => {
   const h = host();
   try {

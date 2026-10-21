@@ -152,12 +152,16 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
     try { await refresh; }
     finally { if (r.inventoryRefresh === refresh) r.inventoryRefresh = undefined; }
   };
-  const exceeded = (r: Runtime, ctx: any): boolean => {
+  const contextMetrics = (r: Runtime, ctx: any) => {
     const usage = ctx.getContextUsage?.();
-    // Automatic rotation uses measured usage, never a speculative post-compaction estimate.
-    return Boolean(usage && Number.isFinite(usage.tokens) && usage.tokens !== null &&
-      r.guard.evaluateUsage(usage, modelId(ctx) || r.state.activeModel).isReserveExceeded);
+    if (!usage) return undefined;
+    const measured = Number.isFinite(usage.tokens) && usage.tokens >= 0;
+    // Rotation and tool fences must share the same estimate when measured usage is absent.
+    return r.guard.evaluateUsage(usage, modelId(ctx) || r.state.activeModel,
+      measured ? undefined : r.guard.extractFallbackDetails(ctx));
   };
+  const exceeded = (r: Runtime, ctx: any): boolean =>
+    contextMetrics(r, ctx)?.isReserveExceeded ?? false;
   const cancelReady = (r: Runtime) => { r.ready = undefined; r.dispatched = false; };
   /**
    * Creates the session runtime once, driven by the persisted project configuration.
@@ -673,6 +677,7 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
       summary: { type: 'string', minLength: 1, maxLength: 12000 },
       memory_id: { type: 'integer', minimum: 1, description: 'An existing session_summary observation, as an alternative to summary.' },
       continue_task: { type: 'boolean', description: 'Continue only unfinished work already authorized. Default false.' },
+      _: { type: 'boolean', description: 'Ignored. Accepted for compatibility with host prompt injections that include this field.' },
     } } as never,
     reachesTools: () => ['mem_save', 'mem_get_observation', 'subagent_list_tasks', 'job_list'],
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -755,11 +760,12 @@ export default function supervisor(pi: ExtensionAPI, overrides: SupervisorHostOv
     if (r.ready && name !== 'supervisor_rotate' && isMutatingTool(name, event.input)) {
       return { block: true, reason: 'Verified rotation is scheduled; no new mutating effects until handover.' };
     }
-    if (!halted(r) && name !== 'supervisor_rotate' && exceeded(r, ctx)) {
-      const usage = ctx.getContextUsage()!;
-      const metrics = r.guard.evaluateUsage(usage, modelId(ctx) || r.state.activeModel);
-      const blocked = r.guard.interceptToolCall(event, metrics.tokens, metrics.contextWindow);
-      if (blocked?.block) return { block: true, reason: blocked.reason };
+    if (!halted(r) && name !== 'supervisor_rotate') {
+      const metrics = contextMetrics(r, ctx);
+      if (metrics?.isReserveExceeded) {
+        const blocked = r.guard.interceptToolCall(event, metrics.tokens, metrics.contextWindow);
+        if (blocked?.block) return { block: true, reason: blocked.reason };
+      }
     }
     try {
       r.journal.recordToolCallPre({ toolCallId: event.toolCallId, parentToolCallId: event.parentToolCallId, sessionId: r.sessionId, turnIndex: 0, toolName: name, args: event.input, isMutating: mutating });

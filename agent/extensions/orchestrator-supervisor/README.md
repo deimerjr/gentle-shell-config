@@ -47,7 +47,7 @@ Models come from Pi's live chat registry (`getAvailable()`, falling back to `get
 | Setting or condition | Behavior |
 | --- | --- |
 | Enabled off | Stops supervisor automation for this project; settings and saved models remain intact. Ordinary user tools are unaffected, except genuine uncertain-effect safety fences. |
-| Auto rotation on | At the configured measured context threshold, asks the agent to checkpoint and rotate. Estimated or unavailable usage does not trigger it. |
+| Auto rotation on | At the configured context threshold, asks the agent to checkpoint and rotate. Uses measured nonnegative finite tokens when available; otherwise estimates from the current branch, compaction summary and system prompt. The tool safety ceiling uses the same estimate. A missing usage report does not trigger rotation. |
 | Auto rotation off | Disables the threshold trigger, not the context safety ceiling or an explicitly requested rotation through the agent. |
 | Auto model switch on | Selects an eligible active-slot model on fresh startup/new sessions. A verified rotation then restores the outgoing model and thinking level before continuity. Handles provider failures and recovery within those selected models. |
 | Auto model switch off | Does not assign models automatically; an interrupted provider-recovery obligation remains pending until re-enabled. An intentional verified rotation still transfers the outgoing model and thinking level. |
